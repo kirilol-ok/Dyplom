@@ -283,22 +283,21 @@ install_calico_ebpf() {
   msg "Waiting for nodes to become Ready before eBPF switch"
   kubectl wait --for=condition=Ready nodes --all --timeout=600s
 
-  msg "Switching Calico to eBPF dataplane"
+  msg "Adjusting Calico eBPF settings for k3d/k3s"
+
   kubectl patch installation.operator.tigera.io default --type merge -p '{
     "spec": {
       "calicoNetwork": {
         "linuxDataplane": "BPF",
-        "bpfNetworkBootstrap": "Enabled",
-        "kubeProxyManagement": "Enabled",
-        "containerIPForwarding": "Enabled"
+        "kubeProxyManagement": "Disabled"
       }
     }
   }'
 
-  msg "Disabling Calico BPF kube-proxy healthz port to avoid kube-proxy conflict on 10256"
   kubectl patch felixconfiguration default --type merge -p '{
     "spec": {
-      "bpfKubeProxyHealthzPort": 0
+      "bpfKubeProxyHealthzPort": 0,
+      "bpfKubeProxyIptablesCleanupEnabled": false
     }
   }'
 
@@ -365,6 +364,13 @@ install_monitoring() {
     return 0
   fi
 
+  ensure_namespace "${MONITORING_NS}"
+
+  kubectl delete job -n "${MONITORING_NS}" \
+    kps-kube-prometheus-stack-admission-create \
+    kps-kube-prometheus-stack-admission-patch \
+    --ignore-not-found=true || true
+    
   check_monitoring_tools
   msg "Installing kube-prometheus-stack through Helm"
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
@@ -430,19 +436,33 @@ start_monitoring_port_forwards() {
 
   local grafana_svc
   grafana_svc="$(find_service_by_label "${MONITORING_NS}" 'app.kubernetes.io/name=grafana')"
+
   local prometheus_svc
-  prometheus_svc="$(find_service_by_label "${MONITORING_NS}" 'app.kubernetes.io/name=prometheus')"
+  prometheus_svc="$(kubectl get svc -n "${MONITORING_NS}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | grep -E '^kps-kube-prometheus-stack-prometheus$|prometheus-kps-kube-prometheus-stack-prometheus$|prometheus-operated$' \
+    | head -n1 || true)"
+
+  if [[ -z "${prometheus_svc}" ]]; then
+    prometheus_svc="$(kubectl get svc -n "${MONITORING_NS}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+      | grep -Ei 'prometheus' \
+      | grep -Eiv 'alertmanager|node-exporter|operator|webhook' \
+      | head -n1 || true)"
+  fi
 
   if [[ -n "${grafana_svc}" ]]; then
     start_port_forward_bg "${MONITORING_NS}" "${grafana_svc}" 3000 80 "${model_name}-grafana"
   else
     warn "Grafana service not found"
+    kubectl get svc -n "${MONITORING_NS}" || true
   fi
 
   if [[ -n "${prometheus_svc}" ]]; then
     start_port_forward_bg "${MONITORING_NS}" "${prometheus_svc}" 9090 9090 "${model_name}-prometheus"
   else
     warn "Prometheus service not found"
+    kubectl get svc -n "${MONITORING_NS}" || true
   fi
 }
 
