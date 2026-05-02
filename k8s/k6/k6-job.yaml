@@ -1,0 +1,81 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: __APP_NS__
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: k6
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.51.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -u
+              set +e
+              k6 run --out json=/results/k6-raw.json "/scripts/__K6_SCRIPT__"
+              code=$?
+              set -e
+              touch /results/.k6-finished
+              echo "k6 finished with code ${code}, waiting for result collection"
+              i=0
+              while [ ! -f /results/.copied ] && [ "$i" -lt 600 ]; do
+                i=$((i + 1))
+                sleep 1
+              done
+              exit "$code"
+          env:
+            - name: MODEL
+              value: "__MODEL__"
+            - name: VUS
+              value: "__VUS__"
+            - name: DURATION
+              value: "__DURATION__"
+            - name: TARGET_URL
+              value: "__TARGET_URL__"
+            - name: RPS
+              value: "__RPS__"
+            - name: PAYLOAD_SIZE
+              value: "__PAYLOAD_SIZE__"
+            - name: RESPONSE_SIZE
+              value: "__RESPONSE_SIZE__"
+            - name: REQUEST_METHOD
+              value: "__REQUEST_METHOD__"
+            - name: REQUEST_PATH
+              value: "__REQUEST_PATH__"
+            - name: TEST_MODE
+              value: "__TEST_MODE__"
+            - name: NO_CONNECTION_REUSE
+              value: "__NO_CONNECTION_REUSE__"
+            - name: SERVER_DELAY_MS
+              value: "__SERVER_DELAY_MS__"
+            - name: TIMEOUT
+              value: "__TIMEOUT__"
+            - name: SLEEP_MS
+              value: "__SLEEP_MS__"
+            - name: FAIL_RATE_THRESHOLD
+              value: "__FAIL_RATE_THRESHOLD__"
+            - name: P95_THRESHOLD_MS
+              value: "__P95_THRESHOLD_MS__"
+            - name: SUCCESS_RATE_THRESHOLD
+              value: "__SUCCESS_RATE_THRESHOLD__"
+          volumeMounts:
+            - name: k6-scripts
+              mountPath: /scripts
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: k6-scripts
+          configMap:
+            name: k6-scripts
+        - name: results
+          emptyDir: {}

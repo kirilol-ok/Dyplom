@@ -1,0 +1,20 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: server-l4-allow-client
+  namespace: __APP_NS__
+spec:
+  selector: app == 'server'
+  types:
+    - Ingress
+    - Egress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        selector: app == 'client'
+      destination:
+        ports:
+          - 8080
+  egress:
+    - action: Allow
