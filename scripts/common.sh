@@ -105,13 +105,21 @@ wait_api_server() {
 
   msg "Waiting for Kubernetes API of ${cluster_name}"
   while (( SECONDS < end_ts )); do
-    if kubectl config use-context "k3d-${cluster_name}" >/dev/null 2>&1 && kubectl get --raw=/readyz >/dev/null 2>&1; then
+    # Do not use /readyz here. A fresh k3s cluster without CNI can report
+    # NotReady until Calico is installed, but the API is already usable.
+    if kubectl config use-context "k3d-${cluster_name}" >/dev/null 2>&1 \
+      && kubectl --request-timeout=5s get nodes >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
 
-  die "Kubernetes API did not become ready for ${cluster_name}"
+  warn "Kubernetes API check failed for ${cluster_name}. Diagnostics:"
+  kubectl config current-context 2>/dev/null || true
+  kubectl get --raw=/livez 2>/dev/null || true
+  kubectl get --raw=/readyz?verbose 2>/dev/null || true
+  kubectl get nodes -o wide 2>/dev/null || true
+  die "Kubernetes API did not become reachable for ${cluster_name}"
 }
 
 create_cluster() {
@@ -123,20 +131,18 @@ create_cluster() {
     return 0
   fi
 
-  msg "Creating k3d cluster ${name} without flannel, k3s network policy and kube-proxy"
+  msg "Creating k3d cluster ${name}"
+
   k3d cluster create "$name" \
     --image "${K3D_IMAGE}" \
-    --servers "${K3D_SERVERS}" \
-    --agents "${K3D_AGENTS}" \
+    --servers 1 \
+    --agents 1 \
     --k3s-arg "--flannel-backend=none@server:*" \
     --k3s-arg "--disable-network-policy@server:*" \
-    --k3s-arg "--disable-kube-proxy@server:*" \
-    --k3s-arg "--disable=traefik@server:*" \
-    --k3s-arg "--cluster-cidr=${POD_CIDR}@server:*" \
-    --k3s-arg "--service-cidr=${SERVICE_CIDR}@server:*"
+    --k3s-arg "--tls-san=10.43.0.1@server:*" \
+    --wait
 
   use_cluster "$name"
-  wait_api_server "$name"
 }
 
 fix_kubeconfig_server_port() {
@@ -223,28 +229,103 @@ wait_tigerastatus() {
 }
 
 install_calico_ebpf() {
-  local connect_time_lb="${1:-TCP}"
+  local cluster_name="${1:-}"
+  local calico_version="${CALICO_VERSION:-v3.32.0}"
 
-  msg "Installing Calico Open Source ${CALICO_VERSION} with Tigera Operator"
-  kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
-  kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml"
+  msg "Installing Calico Open Source ${calico_version} with Tigera Operator"
 
-  msg "Enabling Calico container IP forwarding"
-  kubectl patch installation.operator.tigera.io default --type merge \
-    -p '{"spec":{"calicoNetwork":{"containerIPForwarding":"Enabled"}}}' || true
+  msg "Installing Calico operator CRDs with server-side apply"
+  kubectl apply --server-side --force-conflicts \
+    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/v1_crd_projectcalico_org.yaml"
 
-  msg "Enabling Calico eBPF dataplane"
-  kubectl patch installation.operator.tigera.io default --type merge \
-    -p '{"spec":{"calicoNetwork":{"linuxDataplane":"BPF"}}}'
+  msg "Waiting for Calico operator CRDs"
+  kubectl wait --for=condition=Established \
+    crd/installations.operator.tigera.io \
+    --timeout=180s
 
-  if [[ "${connect_time_lb}" == "Disabled" ]]; then
-    msg "Disabling Calico BPF connect-time load balancing for Istio/Dikastes compatibility"
-    kubectl patch felixconfiguration default --type merge \
-      -p '{"spec":{"bpfConnectTimeLoadBalancing":"Disabled"}}' || true
-  fi
+  kubectl wait --for=condition=Established \
+    crd/apiservers.operator.tigera.io \
+    --timeout=180s
 
-  wait_tigerastatus
-  wait_pods_ready calico-system 600s
+  msg "Installing Tigera Operator"
+  kubectl apply --server-side --force-conflicts \
+    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/tigera-operator.yaml"
+
+  msg "Waiting for Tigera Operator deployment"
+  kubectl rollout status deployment/tigera-operator \
+    -n tigera-operator \
+    --timeout=300s
+
+  msg "Installing Calico custom resources in standard mode first"
+  kubectl apply --server-side --force-conflicts \
+    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/custom-resources.yaml"
+
+  msg "Waiting for Calico namespace"
+  wait_namespace_exists "calico-system" 300
+
+  msg "Waiting for Calico resources to be created"
+  wait_resource_exists "daemonset/calico-node" "calico-system" 300
+  wait_resource_exists "deployment/calico-kube-controllers" "calico-system" 300
+
+  msg "Waiting for Calico node daemonset in standard mode"
+  kubectl rollout status daemonset/calico-node \
+    -n calico-system \
+    --timeout=600s
+
+  msg "Waiting for Kubernetes nodes to become Ready in standard mode"
+  kubectl wait --for=condition=Ready nodes --all --timeout=600s
+
+  msg "Waiting for Calico kube controllers in standard mode"
+  kubectl rollout status deployment/calico-kube-controllers \
+    -n calico-system \
+    --timeout=600s
+
+  msg "Waiting for nodes to become Ready before eBPF switch"
+  kubectl wait --for=condition=Ready nodes --all --timeout=600s
+
+  msg "Switching Calico to eBPF dataplane"
+  kubectl patch installation.operator.tigera.io default --type merge -p '{
+    "spec": {
+      "calicoNetwork": {
+        "linuxDataplane": "BPF",
+        "bpfNetworkBootstrap": "Enabled",
+        "kubeProxyManagement": "Enabled",
+        "containerIPForwarding": "Enabled"
+      }
+    }
+  }'
+
+  msg "Disabling Calico BPF kube-proxy healthz port to avoid kube-proxy conflict on 10256"
+  kubectl patch felixconfiguration default --type merge -p '{
+    "spec": {
+      "bpfKubeProxyHealthzPort": 0
+    }
+  }'
+
+  msg "Waiting for Calico components after eBPF switch"
+  kubectl rollout status daemonset/calico-node \
+    -n calico-system \
+    --timeout=600s
+
+  kubectl rollout status deployment/calico-kube-controllers \
+    -n calico-system \
+    --timeout=600s
+
+  msg "Waiting for nodes to stay Ready after eBPF switch"
+  kubectl wait --for=condition=Ready nodes --all --timeout=600s
+
+  msg "Calico eBPF installation status"
+  kubectl get nodes -o wide
+  kubectl get pods -n calico-system
+  kubectl get tigerastatus || true
+
+  msg "Checking eBPF dataplane setting"
+  kubectl get installation.operator.tigera.io default \
+    -o jsonpath='{.spec.calicoNetwork.linuxDataplane}{"\n"}'
+
+  msg "Checking kube-proxy management setting"
+  kubectl get installation.operator.tigera.io default \
+    -o jsonpath='{.spec.calicoNetwork.kubeProxyManagement}{"\n"}'
 }
 
 verify_calico_ebpf() {
@@ -253,6 +334,29 @@ verify_calico_ebpf() {
   echo
   kubectl get felixconfiguration default -o yaml 2>/dev/null | grep -E 'bpf|BPF|policySyncPathPrefix' || true
   kubectl logs -n calico-system ds/calico-node -c calico-node --tail=200 2>/dev/null | grep -E 'BPF|bpf|dataplane' || true
+}
+
+wait_namespace_exists() {
+  local ns="$1"
+  local timeout="${2:-300}"
+  local end_ts=$((SECONDS + timeout))
+
+  msg "Waiting for namespace ${ns}"
+
+  while (( SECONDS < end_ts )); do
+    if kubectl get ns "${ns}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  warn "Namespace ${ns} was not created in ${timeout}s"
+  warn "Tigera Operator diagnostics:"
+  kubectl get installation default -o yaml 2>/dev/null || true
+  kubectl describe installation default 2>/dev/null || true
+  kubectl logs -n tigera-operator deployment/tigera-operator --tail=200 2>/dev/null || true
+
+  die "Namespace ${ns} was not created"
 }
 
 install_monitoring() {
@@ -522,16 +626,40 @@ copy_k6_result_file_if_exists() {
 
 get_k6_vus_from_script() {
   local script_path="$1"
-  local vus
-  vus="$(grep -E 'const VUS|vus:' "${script_path}" 2>/dev/null | grep -Eo '[0-9]+' | head -n1 || true)"
-  echo "${vus:-20}"
+  local vus=""
+
+  # Supports:
+  # vus: 20
+  # vus: Number(__ENV.VUS || 20)
+  # vus: Number(__ENV.VUS || '20')
+  vus="$(grep -E 'vus:[[:space:]]*([0-9]+|Number\(__ENV\.VUS[[:space:]]*\|\|[[:space:]]*'\''?[0-9]+'\''?\))' "${script_path}" 2>/dev/null \
+    | head -n1 \
+    | sed -E "s/.*vus:[[:space:]]*([0-9]+).*/\1/; t; s/.*__ENV\.VUS[[:space:]]*\|\|[[:space:]]*'?'?([0-9]+)'?'?.*/\1/" || true)"
+
+  if [[ -z "${vus}" || "${vus}" == *"vus:"* ]]; then
+    vus="20"
+  fi
+
+  echo "${vus}"
 }
 
 get_k6_duration_from_script() {
   local script_path="$1"
-  local duration
-  duration="$(grep -E "duration:" "${script_path}" 2>/dev/null | head -n1 | sed -E "s/.*duration:[[:space:]]*['\"]([^'\"]+)['\"].*/\1/" || true)"
-  echo "${duration:-30s}"
+  local duration=""
+
+  # Supports:
+  # duration: '30s'
+  # duration: __ENV.DURATION || '30s'
+  # duration: String(__ENV.DURATION || '30s')
+  duration="$(grep -E "duration:[[:space:]]*(__ENV\.DURATION|String\(__ENV\.DURATION|['\"][^'\"]+['\"])" "${script_path}" 2>/dev/null \
+    | head -n1 \
+    | sed -E "s/.*__ENV\.DURATION[[:space:]]*\|\|[[:space:]]*['\"]([^'\"]+)['\"].*/\1/; t; s/.*duration:[[:space:]]*['\"]([^'\"]+)['\"].*/\1/" || true)"
+
+  if [[ -z "${duration}" || "${duration}" == *"duration:"* || "${duration}" == *"__ENV"* ]]; then
+    duration="30s"
+  fi
+
+  echo "${duration}"
 }
 
 safe_duration_tag() {
@@ -539,15 +667,20 @@ safe_duration_tag() {
 }
 
 build_result_prefix() {
-  local model_short="$1"
+  local model="$1"
   local script_tag="$2"
   local vus="$3"
   local duration="$4"
-  local run_tag="${5:-$(date +%Y%m%d-%H%M%S)}"
-  local duration_tag
-  duration_tag="$(safe_duration_tag "${duration}")"
 
-  echo "${RESULTS_DIR}/${model_short}/${run_tag}-${model_short}-${script_tag}-vus${vus}-dur${duration_tag}"
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+
+  local safe_duration
+  safe_duration="$(echo "${duration}" | tr -c 'A-Za-z0-9_.-' '_')"
+
+  mkdir -p "${RESULTS_DIR}/${model}"
+
+  echo "${RESULTS_DIR}/${model}/${ts}-${model}-${script_tag}-vus${vus}-dur${safe_duration}"
 }
 
 print_ready_message() {
@@ -561,4 +694,54 @@ print_ready_message() {
     echo "Grafana:    http://localhost:3000  login: admin  password: ${GRAFANA_ADMIN_PASSWORD:-admin}"
     echo "Prometheus: http://localhost:9090"
   fi
+}
+
+configure_tigera_direct_api_access() {
+  local cluster_name="$1"
+  local lb_container="k3d-${cluster_name}-serverlb"
+  local server_container="k3d-${cluster_name}-server-0"
+  local api_ip=""
+
+  msg "Configuring Tigera Operator direct Kubernetes API access"
+
+  if docker ps --format '{{.Names}}' | grep -qx "${lb_container}"; then
+    api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${lb_container}" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${api_ip}" ]] && docker ps --format '{{.Names}}' | grep -qx "${server_container}"; then
+    api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${server_container}" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${api_ip}" ]]; then
+    die "Could not determine k3d API container IP for ${cluster_name}"
+  fi
+
+  msg "Using direct API endpoint for Tigera Operator: ${api_ip}:6443"
+
+  kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
+
+  kubectl -n tigera-operator create configmap kubernetes-services-endpoint \
+    --from-literal=KUBERNETES_SERVICE_HOST="${api_ip}" \
+    --from-literal=KUBERNETES_SERVICE_PORT="6443" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
+wait_resource_exists() {
+  local resource="$1"
+  local namespace="$2"
+  local timeout="${3:-300}"
+  local end_ts=$((SECONDS + timeout))
+
+  msg "Waiting for ${resource} in namespace ${namespace}"
+
+  while (( SECONDS < end_ts )); do
+    if kubectl get "${resource}" -n "${namespace}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  warn "Timed out waiting for ${resource} in namespace ${namespace}"
+  kubectl get pods -n "${namespace}" -o wide 2>/dev/null || true
+  die "Resource did not appear: ${resource}"
 }

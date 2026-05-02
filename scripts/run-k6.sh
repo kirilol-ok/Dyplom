@@ -65,8 +65,72 @@ run_k6_job_manifest "${APP_NS}" "${JOB_NAME}" "${K6_SCRIPT}"
 
 POD_NAME="$(wait_k6_pod_created "${APP_NS}" "${JOB_NAME}")"
 
-msg "Waiting for k6 pod to become Ready"
-kubectl wait --for=condition=Ready pod "${POD_NAME}" -n "${APP_NS}" --timeout=180s || true
+msg "Waiting for k6 pod to start"
+
+POD_NAME=""
+
+for _ in $(seq 1 120); do
+  POD_NAME="$(kubectl get pods -n "${APP_NS}" -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+  if [[ -n "${POD_NAME}" ]]; then
+    break
+  fi
+
+  sleep 1
+done
+
+if [[ -z "${POD_NAME}" ]]; then
+  warn "k6 pod was not created"
+  kubectl get pods -n "${APP_NS}" -o wide || true
+  kubectl get events -n "${APP_NS}" --sort-by='.lastTimestamp' | tail -40 || true
+  exit 1
+fi
+
+msg "k6 pod created: ${POD_NAME}"
+
+for _ in $(seq 1 180); do
+  PHASE="$(kubectl get pod "${POD_NAME}" -n "${APP_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  WAITING_REASON="$(kubectl get pod "${POD_NAME}" -n "${APP_NS}" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)"
+  TERMINATED_REASON="$(kubectl get pod "${POD_NAME}" -n "${APP_NS}" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null || true)"
+
+  if [[ "${PHASE}" == "Running" ]]; then
+    msg "k6 pod is Running"
+    break
+  fi
+
+  if [[ "${PHASE}" == "Succeeded" ]]; then
+    msg "k6 pod already Succeeded"
+    break
+  fi
+
+  if [[ "${PHASE}" == "Failed" ]]; then
+    warn "k6 pod Failed"
+    kubectl describe pod "${POD_NAME}" -n "${APP_NS}" || true
+    kubectl logs "${POD_NAME}" -n "${APP_NS}" --all-containers=true || true
+    exit 1
+  fi
+
+  if [[ -n "${WAITING_REASON}" ]]; then
+    msg "k6 pod phase=${PHASE}, waiting=${WAITING_REASON}"
+  elif [[ -n "${TERMINATED_REASON}" ]]; then
+    msg "k6 pod phase=${PHASE}, terminated=${TERMINATED_REASON}"
+  else
+    msg "k6 pod phase=${PHASE}"
+  fi
+
+  sleep 2
+done
+
+PHASE="$(kubectl get pod "${POD_NAME}" -n "${APP_NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+
+if [[ "${PHASE}" != "Running" && "${PHASE}" != "Succeeded" ]]; then
+  warn "k6 pod did not start correctly"
+  kubectl get pod "${POD_NAME}" -n "${APP_NS}" -o wide || true
+  kubectl describe pod "${POD_NAME}" -n "${APP_NS}" || true
+  kubectl logs "${POD_NAME}" -n "${APP_NS}" --all-containers=true || true
+  kubectl get events -n "${APP_NS}" --sort-by='.lastTimestamp' | tail -40 || true
+  exit 1
+fi
 
 mkdir -p "$(dirname "${LOG_FILE}")"
 msg "Streaming logs to ${LOG_FILE}"
