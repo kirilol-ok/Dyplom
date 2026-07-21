@@ -10,7 +10,7 @@ check_base_tools
 create_cluster "${CLUSTER_NAME}"
 use_cluster "${CLUSTER_NAME}"
 
-install_calico_ebpf "TCP"
+install_calico_ebpf "${CLUSTER_NAME}"
 ensure_namespace "${APP_NS}"
 apply_app "${APP_NS}" "normal"
 apply_l4_policy "${APP_NS}"

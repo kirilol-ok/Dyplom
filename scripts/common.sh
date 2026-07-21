@@ -15,8 +15,8 @@ POD_CIDR="${POD_CIDR:-192.168.0.0/16}"
 SERVICE_CIDR="${SERVICE_CIDR:-10.43.0.0/16}"
 APP_NS="${APP_NS:-test-app}"
 MONITORING_NS="${MONITORING_NS:-monitoring}"
-CALICO_VERSION="${CALICO_VERSION:-v3.32.0}"
-DIKASTES_VERSION="${DIKASTES_VERSION:-v3.32}"
+CALICO_VERSION="${CALICO_VERSION:-v3.32.1}"
+DIKASTES_VERSION="${DIKASTES_VERSION:-v3.32.1}"
 ISTIO_VERSION="${ISTIO_VERSION:-1.28.1}"
 INSTALL_MONITORING="${INSTALL_MONITORING:-true}"
 START_PORT_FORWARDS="${START_PORT_FORWARDS:-true}"
@@ -89,8 +89,50 @@ model_short() {
 }
 
 cluster_exists() {
-  local name="$1"
-  k3d cluster list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$name"
+  local name="${1:-}"
+
+  [[ -n "${name}" ]] || return 1
+
+  # Do not parse the human-readable table by a fixed row/column position.
+  # k3d changed this output between versions, which can make values such as
+  # "Disabled" look like a cluster name.
+  k3d cluster list --no-headers 2>/dev/null \
+    | awk -v expected="${name}" '$1 == expected { found = 1 } END { exit !found }'
+}
+
+current_k3d_cluster() {
+  local context=""
+
+  context="$(kubectl config current-context 2>/dev/null || true)"
+  case "${context}" in
+    k3d-*)
+      printf '%s\n' "${context#k3d-}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_cluster_name() {
+  local requested="${1:-}"
+  local current=""
+
+  if cluster_exists "${requested}"; then
+    printf '%s\n' "${requested}"
+    return 0
+  fi
+
+  current="$(current_k3d_cluster 2>/dev/null || true)"
+  if cluster_exists "${current}"; then
+    if [[ -n "${requested}" ]]; then
+      warn "Ignoring invalid cluster name '${requested}'; using current k3d cluster '${current}'"
+    fi
+    printf '%s\n' "${current}"
+    return 0
+  fi
+
+  return 1
 }
 
 container_exists() {
@@ -135,11 +177,15 @@ create_cluster() {
 
   k3d cluster create "$name" \
     --image "${K3D_IMAGE}" \
-    --servers 1 \
-    --agents 1 \
+    --servers "${K3D_SERVERS}" \
+    --agents "${K3D_AGENTS}" \
     --k3s-arg "--flannel-backend=none@server:*" \
     --k3s-arg "--disable-network-policy@server:*" \
-    --k3s-arg "--tls-san=10.43.0.1@server:*" \
+    --k3s-arg "--disable-kube-proxy@server:*" \
+    --k3s-arg "--disable=traefik@server:*" \
+    --k3s-arg "--disable=servicelb@server:*" \
+    --k3s-arg "--cluster-cidr=${POD_CIDR}@server:*" \
+    --k3s-arg "--service-cidr=${SERVICE_CIDR}@server:*" \
     --wait
 
   use_cluster "$name"
@@ -217,83 +263,112 @@ wait_pods_ready() {
   local ns="$1"
   local timeout="${2:-600s}"
   msg "Waiting for pods in namespace ${ns}"
-  kubectl wait --for=condition=Ready pod --all -n "$ns" --timeout="${timeout}" || true
+  kubectl wait --for=condition=Ready pod --all -n "$ns" --timeout="${timeout}"
 }
 
 wait_tigerastatus() {
-  msg "Waiting for Calico Tigerastatus resources"
-  for name in apiserver calico; do
-    kubectl wait --for=condition=Available "tigerastatus/${name}" --timeout=600s >/dev/null 2>&1 || true
-  done
-  kubectl get tigerastatus || true
+  local timeout="${1:-600s}"
+
+  msg "Waiting for required Calico Tigerastatus resources"
+  wait_resource_exists "tigerastatus/calico" "" 300
+  wait_resource_exists "tigerastatus/apiserver" "" 300
+
+  kubectl wait --for=condition=Available tigerastatus/calico --timeout="${timeout}"
+  kubectl wait --for=condition=Available tigerastatus/apiserver --timeout="${timeout}"
+
+  # Only the core Calico components are mandatory for baseline, ambient L4,
+  # and L7 Dikastes. Goldmane and Whisker are optional observability
+  # components and may transiently report Degraded while the aggregated
+  # projectcalico.org/v3 API is becoming ready.
+  local required_bad
+  required_bad="$(kubectl get tigerastatus calico apiserver \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' \
+    | grep -E 'Progressing=True|Degraded=True' || true)"
+
+  if [[ -n "${required_bad}" ]]; then
+    kubectl get tigerastatus
+    die "Required Calico components report Progressing=True or Degraded=True"
+  fi
+
+  local optional_bad
+  optional_bad="$(kubectl get tigerastatus -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[*]}{.type}={.status}{" "}{end}{"\n"}{end}' \
+    | grep -Ev '^(calico|apiserver) ' \
+    | grep -E 'Progressing=True|Degraded=True' || true)"
+
+  if [[ -n "${optional_bad}" ]]; then
+    warn "Optional Calico components are not ready yet; continuing because core networking is healthy"
+    printf '%s\n' "${optional_bad}" >&2
+  fi
+
+  kubectl get tigerastatus
 }
 
 install_calico_ebpf() {
-  local cluster_name="${1:-}"
+  local requested_cluster_name="${1:-}"
+  local cluster_name=""
   local calico_version="${CALICO_VERSION:-v3.32.0}"
+
+  cluster_name="$(resolve_cluster_name "${requested_cluster_name}" || true)"
+  if [[ -z "${cluster_name}" ]]; then
+    die "K3d cluster does not exist: ${requested_cluster_name:-<empty>}"
+  fi
+
+  use_cluster "${cluster_name}"
 
   msg "Installing Calico Open Source ${calico_version} with Tigera Operator"
 
-  msg "Installing Calico operator CRDs with server-side apply"
-  kubectl apply --server-side --force-conflicts \
-    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/v1_crd_projectcalico_org.yaml"
+  msg "Installing Calico CRDs"
+  kubectl apply --server-side --force-conflicts     -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/v1_crd_projectcalico_org.yaml"
 
   msg "Waiting for Calico operator CRDs"
-  kubectl wait --for=condition=Established \
-    crd/installations.operator.tigera.io \
-    --timeout=180s
+  kubectl wait --for=condition=Established crd/installations.operator.tigera.io --timeout=180s
+  kubectl wait --for=condition=Established crd/apiservers.operator.tigera.io --timeout=180s
 
-  kubectl wait --for=condition=Established \
-    crd/apiservers.operator.tigera.io \
-    --timeout=180s
+  configure_tigera_direct_api_access "${cluster_name}"
 
   msg "Installing Tigera Operator"
-  kubectl apply --server-side --force-conflicts \
-    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/tigera-operator.yaml"
+  kubectl apply --server-side --force-conflicts     -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/tigera-operator.yaml"
 
   msg "Waiting for Tigera Operator deployment"
-  kubectl rollout status deployment/tigera-operator \
-    -n tigera-operator \
-    --timeout=300s
+  kubectl rollout status deployment/tigera-operator     -n tigera-operator     --timeout=300s
 
-  msg "Installing Calico custom resources in standard mode first"
-  kubectl apply --server-side --force-conflicts \
-    -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/custom-resources.yaml"
+  msg "Installing Calico custom resources"
+  kubectl apply --server-side --force-conflicts     -f "https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests/custom-resources.yaml"
+
+  msg "Configuring Calico eBPF before waiting for components"
+  kubectl patch installation.operator.tigera.io default --type merge -p "$(cat <<JSON
+{
+  "spec": {
+    "controlPlaneReplicas": 1,
+    "calicoNetwork": {
+      "linuxDataplane": "BPF",
+      "bpfNetworkBootstrap": "Disabled",
+      "kubeProxyManagement": "Disabled",
+      "ipPools": [
+        {
+          "name": "default-ipv4-ippool",
+          "blockSize": 26,
+          "cidr": "${POD_CIDR}",
+          "encapsulation": "VXLANCrossSubnet",
+          "natOutgoing": "Enabled",
+          "nodeSelector": "all()"
+        }
+      ]
+    }
+  }
+}
+JSON
+)"
 
   msg "Waiting for Calico namespace"
   wait_namespace_exists "calico-system" 300
 
-  msg "Waiting for Calico resources to be created"
+  msg "Waiting for Calico resources"
   wait_resource_exists "daemonset/calico-node" "calico-system" 300
   wait_resource_exists "deployment/calico-kube-controllers" "calico-system" 300
+  wait_resource_exists "deployment/calico-apiserver" "calico-system" 300
 
-  msg "Waiting for Calico node daemonset in standard mode"
-  kubectl rollout status daemonset/calico-node \
-    -n calico-system \
-    --timeout=600s
-
-  msg "Waiting for Kubernetes nodes to become Ready in standard mode"
-  kubectl wait --for=condition=Ready nodes --all --timeout=600s
-
-  msg "Waiting for Calico kube controllers in standard mode"
-  kubectl rollout status deployment/calico-kube-controllers \
-    -n calico-system \
-    --timeout=600s
-
-  msg "Waiting for nodes to become Ready before eBPF switch"
-  kubectl wait --for=condition=Ready nodes --all --timeout=600s
-
-  msg "Adjusting Calico eBPF settings for k3d/k3s"
-
-  kubectl patch installation.operator.tigera.io default --type merge -p '{
-    "spec": {
-      "calicoNetwork": {
-        "linuxDataplane": "BPF",
-        "kubeProxyManagement": "Disabled"
-      }
-    }
-  }'
-
+  msg "Configuring Felix for a cluster without kube-proxy"
   kubectl patch felixconfiguration default --type merge -p '{
     "spec": {
       "bpfKubeProxyHealthzPort": 0,
@@ -301,30 +376,36 @@ install_calico_ebpf() {
     }
   }'
 
-  msg "Waiting for Calico components after eBPF switch"
-  kubectl rollout status daemonset/calico-node \
-    -n calico-system \
-    --timeout=600s
+  configure_calico_direct_api_env "${cluster_name}"
 
-  kubectl rollout status deployment/calico-kube-controllers \
-    -n calico-system \
-    --timeout=600s
+  msg "Waiting for Calico node daemonset"
+  kubectl rollout status daemonset/calico-node     -n calico-system     --timeout=600s
 
-  msg "Waiting for nodes to stay Ready after eBPF switch"
+  msg "Waiting for Calico kube controllers"
+  if ! kubectl rollout status deployment/calico-kube-controllers     -n calico-system     --timeout=600s; then
+    kubectl get pods -n calico-system -o wide || true
+    kubectl logs -n calico-system deployment/calico-kube-controllers --all-containers --tail=300 || true
+    die "Calico kube controllers rollout failed"
+  fi
+
+  msg "Waiting for Calico API server"
+  if ! kubectl rollout status deployment/calico-apiserver     -n calico-system     --timeout=600s; then
+    kubectl get pods -n calico-system -o wide || true
+    kubectl logs -n calico-system deployment/calico-apiserver --all-containers --tail=300 || true
+    die "Calico API server rollout failed"
+  fi
+
+  msg "Waiting for Kubernetes nodes to become Ready"
   kubectl wait --for=condition=Ready nodes --all --timeout=600s
+
+  wait_tigerastatus 600s
 
   msg "Calico eBPF installation status"
   kubectl get nodes -o wide
   kubectl get pods -n calico-system
-  kubectl get tigerastatus || true
 
-  msg "Checking eBPF dataplane setting"
-  kubectl get installation.operator.tigera.io default \
-    -o jsonpath='{.spec.calicoNetwork.linuxDataplane}{"\n"}'
-
-  msg "Checking kube-proxy management setting"
-  kubectl get installation.operator.tigera.io default \
-    -o jsonpath='{.spec.calicoNetwork.kubeProxyManagement}{"\n"}'
+  msg "Checking eBPF settings"
+  kubectl get installation.operator.tigera.io default -o jsonpath='dataplane={.spec.calicoNetwork.linuxDataplane} bootstrap={.spec.calicoNetwork.bpfNetworkBootstrap} kubeProxyManagement={.spec.calicoNetwork.kubeProxyManagement} replicas={.spec.controlPlaneReplicas}{"\n"}'
 }
 
 verify_calico_ebpf() {
@@ -512,9 +593,50 @@ apply_l7_policy() {
 
 install_istio_ambient_l4() {
   check_istio_tools
+
+  msg "Configuring Calico eBPF for Istio Ambient"
+  kubectl patch felixconfiguration default \
+    --type merge \
+    -p '{
+      "spec": {
+        "bpfConnectTimeLoadBalancing": "Disabled"
+      }
+    }'
+
+  msg "Waiting for bpfConnectTimeLoadBalancing=Disabled"
+  local timeout=120
+  local end_ts=$((SECONDS + timeout))
+  local current_value=""
+
+  while (( SECONDS < end_ts )); do
+    current_value="$(
+      kubectl get felixconfiguration default \
+        -o jsonpath='{.spec.bpfConnectTimeLoadBalancing}' \
+        2>/dev/null || true
+    )"
+
+    if [[ "${current_value}" == "Disabled" ]]; then
+      break
+    fi
+
+    sleep 2
+  done
+
+  if [[ "${current_value}" != "Disabled" ]]; then
+    die "Failed to configure bpfConnectTimeLoadBalancing=Disabled"
+  fi
+
+  msg "Calico setting confirmed: bpfConnectTimeLoadBalancing=${current_value}"
+
   msg "Installing Istio ${ISTIO_VERSION} with ambient profile"
   istioctl install --set profile=ambient -y
-  kubectl wait --for=condition=Ready pod --all -n istio-system --timeout=600s || true
+
+  kubectl wait \
+    --for=condition=Ready \
+    pod \
+    --all \
+    -n istio-system \
+    --timeout=600s
 }
 
 install_istio_dikastes() {
@@ -717,51 +839,69 @@ print_ready_message() {
 }
 
 configure_tigera_direct_api_access() {
-  local cluster_name="$1"
-  local lb_container="k3d-${cluster_name}-serverlb"
+  local cluster_name="${1:?Cluster name is required}"
   local server_container="k3d-${cluster_name}-server-0"
+  local network_name="k3d-${cluster_name}"
   local api_ip=""
 
   msg "Configuring Tigera Operator direct Kubernetes API access"
 
-  if docker ps --format '{{.Names}}' | grep -qx "${lb_container}"; then
-    api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${lb_container}" 2>/dev/null || true)"
+  if ! container_exists "${server_container}"; then
+    die "K3d server container not found: ${server_container}"
   fi
 
-  if [[ -z "${api_ip}" ]] && docker ps --format '{{.Names}}' | grep -qx "${server_container}"; then
-    api_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${server_container}" 2>/dev/null || true)"
-  fi
+  api_ip="$(docker inspect     --format "{{with index .NetworkSettings.Networks \"${network_name}\"}}{{.IPAddress}}{{end}}"     "${server_container}" 2>/dev/null || true)"
 
   if [[ -z "${api_ip}" ]]; then
-    die "Could not determine k3d API container IP for ${cluster_name}"
+    warn "Could not get IP from expected Docker network: ${network_name}"
+    docker inspect       --format '{{range $name, $config := .NetworkSettings.Networks}}{{$name}}={{$config.IPAddress}} {{end}}'       "${server_container}" >&2 || true
+    die "Could not determine direct Kubernetes API IP for ${cluster_name}"
   fi
 
   msg "Using direct API endpoint for Tigera Operator: ${api_ip}:6443"
 
   kubectl create namespace tigera-operator --dry-run=client -o yaml | kubectl apply -f -
 
-  kubectl -n tigera-operator create configmap kubernetes-services-endpoint \
-    --from-literal=KUBERNETES_SERVICE_HOST="${api_ip}" \
-    --from-literal=KUBERNETES_SERVICE_PORT="6443" \
-    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n tigera-operator create configmap kubernetes-services-endpoint     --from-literal=KUBERNETES_SERVICE_HOST="${api_ip}"     --from-literal=KUBERNETES_SERVICE_PORT="6443"     --dry-run=client -o yaml | kubectl apply -f -
+}
+
+configure_calico_direct_api_env() {
+  local cluster_name="${1:?Cluster name is required}"
+  local server_container="k3d-${cluster_name}-server-0"
+  local network_name="k3d-${cluster_name}"
+  local api_ip=""
+
+  api_ip="$(docker inspect     --format "{{with index .NetworkSettings.Networks \"${network_name}\"}}{{.IPAddress}}{{end}}"     "${server_container}" 2>/dev/null || true)"
+
+  [[ -n "${api_ip}" ]] || die "Could not determine API server IP for ${cluster_name}"
+
+  msg "Configuring Calico components to use direct API endpoint ${api_ip}:6443"
+
+  kubectl set env deployment/calico-kube-controllers     -n calico-system     KUBERNETES_SERVICE_HOST="${api_ip}"     KUBERNETES_SERVICE_PORT="6443"
+
+  kubectl set env deployment/calico-apiserver     -n calico-system     KUBERNETES_SERVICE_HOST="${api_ip}"     KUBERNETES_SERVICE_PORT="6443"
 }
 
 wait_resource_exists() {
   local resource="$1"
-  local namespace="$2"
+  local namespace="${2:-}"
   local timeout="${3:-300}"
   local end_ts=$((SECONDS + timeout))
 
-  msg "Waiting for ${resource} in namespace ${namespace}"
+  msg "Waiting for ${resource}${namespace:+ in namespace ${namespace}}"
 
   while (( SECONDS < end_ts )); do
-    if kubectl get "${resource}" -n "${namespace}" >/dev/null 2>&1; then
-      return 0
+    if [[ -n "${namespace}" ]]; then
+      kubectl get "${resource}" -n "${namespace}" >/dev/null 2>&1 && return 0
+    else
+      kubectl get "${resource}" >/dev/null 2>&1 && return 0
     fi
     sleep 2
   done
 
-  warn "Timed out waiting for ${resource} in namespace ${namespace}"
-  kubectl get pods -n "${namespace}" -o wide 2>/dev/null || true
+  warn "Timed out waiting for ${resource}${namespace:+ in namespace ${namespace}}"
+  if [[ -n "${namespace}" ]]; then
+    kubectl get pods -n "${namespace}" -o wide 2>/dev/null || true
+  fi
   die "Resource did not appear: ${resource}"
 }
