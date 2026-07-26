@@ -690,8 +690,30 @@ run_k6_job_manifest() {
   local k6_script="$3"
 
   msg "Recreating k6 job ${job_name} in namespace ${ns}"
-  kubectl delete job "${job_name}" -n "${ns}" --ignore-not-found=true >/dev/null 2>&1 || true
-  wait_job_deleted "$ns" "$job_name"
+  
+  kubectl delete job "${job_name}" \
+    -n "${ns}" \
+    --ignore-not-found=true \
+    --cascade=foreground \
+    --wait=true \
+    >/dev/null 2>&1 || true
+
+  wait_job_deleted "${ns}" "${job_name}"
+
+  if ! wait_k6_pods_deleted "${ns}" "${job_name}"; then
+    warn "Force deleting old k6 pods"
+
+    kubectl delete pod \
+      -n "${ns}" \
+      -l "job-name=${job_name}" \
+      --grace-period=0 \
+      --force \
+      --ignore-not-found=true \
+      >/dev/null 2>&1 || true
+
+    wait_k6_pods_deleted "${ns}" "${job_name}" \
+      || die "Could not remove old k6 pods"
+  fi
 
   sed \
     -e "s|__APP_NS__|${ns}|g" \
@@ -700,7 +722,8 @@ run_k6_job_manifest() {
     -e "s|__MODEL__|${K6_MODEL:-${ns}}|g" \
     -e "s|__VUS__|${VUS:-20}|g" \
     -e "s|__DURATION__|${DURATION:-30s}|g" \
-    -e "s|__TARGET_URL__|${TARGET_URL:-http://client:8080/proxy}|g" \
+    -e "s|__TARGET_URL__|${TARGET_URL:-http://server:8080}|g" \
+    -e "s|__TARGET_MODE__|${TARGET_MODE:-direct}|g" \
     -e "s|__RPS__|${RPS:-0}|g" \
     -e "s|__PAYLOAD_SIZE__|${PAYLOAD_SIZE:-128}|g" \
     -e "s|__RESPONSE_SIZE__|${RESPONSE_SIZE:-128}|g" \
@@ -732,6 +755,39 @@ wait_k6_pod_created() {
   done
 
   die "Timed out waiting for k6 pod creation for job ${job_name}"
+}
+
+wait_k6_pods_deleted() {
+  local ns="$1"
+  local job_name="$2"
+
+  for _ in $(seq 1 120); do
+    local pod_count
+
+    pod_count="$(
+      kubectl get pods \
+        -n "${ns}" \
+        -l "job-name=${job_name}" \
+        --no-headers \
+        2>/dev/null \
+        | wc -l
+    )"
+
+    if (( pod_count == 0 )); then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  warn "Old k6 pods did not disappear"
+
+  kubectl get pods \
+    -n "${ns}" \
+    -l "job-name=${job_name}" \
+    -o wide || true
+
+  return 1
 }
 
 wait_for_pod_file() {
@@ -813,16 +869,26 @@ build_result_prefix() {
   local script_tag="$2"
   local vus="$3"
   local duration="$4"
+  local run_tag="${5:-}"
 
   local ts
   ts="$(date +%Y%m%d-%H%M%S)"
 
   local safe_duration
-  safe_duration="$(echo "${duration}" | tr -c 'A-Za-z0-9_.-' '_')"
+  safe_duration="$(printf '%s' "${duration}" | tr -c 'A-Za-z0-9_.-' '_')"
+
+  local safe_run_tag=""
+  if [[ -n "${run_tag}" ]]; then
+    safe_run_tag="$(printf '%s' "${run_tag}" | tr -c 'A-Za-z0-9_.-' '_')"
+  fi
 
   mkdir -p "${RESULTS_DIR}/${model}"
 
-  echo "${RESULTS_DIR}/${model}/${ts}-${model}-${script_tag}-vus${vus}-dur${safe_duration}"
+  if [[ -n "${safe_run_tag}" ]]; then
+    echo "${RESULTS_DIR}/${model}/${ts}-${model}-${script_tag}-${safe_run_tag}-vus${vus}-dur${safe_duration}"
+  else
+    echo "${RESULTS_DIR}/${model}/${ts}-${model}-${script_tag}-vus${vus}-dur${safe_duration}"
+  fi
 }
 
 print_ready_message() {

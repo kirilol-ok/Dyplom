@@ -22,10 +22,33 @@ K6_SCRIPT_PATH="${ROOT_DIR}/k6/${K6_SCRIPT}"
 [[ -f "${K6_SCRIPT_PATH}" ]] || die "K6 script not found: ${K6_SCRIPT_PATH}"
 
 JOB_NAME="${JOB_NAME:-k6-test}"
-SCRIPT_TAG="${K6_SCRIPT%.js}"
+
+TARGET_MODE="${TARGET_MODE:-}"
+TARGET_URL="${TARGET_URL:-}"
+
+if [[ -z "${TARGET_MODE}" && -z "${TARGET_URL}" ]]; then
+  TARGET_MODE="direct"
+  TARGET_URL="http://server:8080"
+elif [[ -z "${TARGET_MODE}" ]]; then
+  if [[ "${TARGET_URL}" == *"/proxy"* ]]; then
+    TARGET_MODE="proxy"
+  else
+    TARGET_MODE="direct"
+  fi
+elif [[ -z "${TARGET_URL}" ]]; then
+  case "${TARGET_MODE}" in
+    direct)
+      TARGET_URL="http://server:8080"
+      ;;
+    proxy)
+      TARGET_URL="http://client:8080/proxy"
+      ;;
+  esac
+fi
+
+SCRIPT_TAG="${K6_SCRIPT%.js}-${TARGET_MODE}"
 VUS="${VUS:-$(get_k6_vus_from_script "${K6_SCRIPT_PATH}")}"
 DURATION="${DURATION:-$(get_k6_duration_from_script "${K6_SCRIPT_PATH}")}"
-TARGET_URL="${TARGET_URL:-http://client:8080/proxy}"
 RPS="${RPS:-0}"
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-128}"
 RESPONSE_SIZE="${RESPONSE_SIZE:-128}"
@@ -45,11 +68,28 @@ LOG_FILE="${RESULT_PREFIX}.log"
 SUMMARY_FILE="${RESULT_PREFIX}-summary.json"
 RAW_FILE="${RESULT_PREFIX}-raw.json"
 
+case "${TARGET_MODE}" in
+  proxy|direct)
+    ;;
+  *)
+    die "Unknown TARGET_MODE=${TARGET_MODE}. Use proxy or direct"
+    ;;
+esac
+
+if [[ "${TARGET_MODE}" == "direct" && "${TARGET_URL}" == *"/proxy"* ]]; then
+  die "Invalid target configuration: direct mode cannot use a proxy URL (${TARGET_URL})"
+fi
+
+if [[ "${TARGET_MODE}" == "proxy" && "${TARGET_URL}" == http://server:* ]]; then
+  die "Invalid target configuration: proxy mode cannot target the server Service directly (${TARGET_URL})"
+fi
+
 msg "Using model: ${MODEL_SHORT}"
 msg "Cluster: ${CLUSTER_NAME}"
 msg "Namespace: ${APP_NS}"
 msg "K6 script: ${K6_SCRIPT}"
 msg "VUS=${VUS}, DURATION=${DURATION}, RPS=${RPS}, MODE=${TEST_MODE}"
+msg "Target mode: ${TARGET_MODE}"
 msg "Target: ${TARGET_URL}"
 msg "Local result prefix: ${RESULT_PREFIX}"
 
@@ -57,27 +97,15 @@ check_base_tools
 use_cluster "${CLUSTER_NAME}"
 create_k6_configmap "${APP_NS}"
 
-export VUS DURATION TARGET_URL RPS PAYLOAD_SIZE RESPONSE_SIZE REQUEST_METHOD REQUEST_PATH TEST_MODE
+export VUS DURATION TARGET_URL TARGET_MODE RPS PAYLOAD_SIZE RESPONSE_SIZE REQUEST_METHOD REQUEST_PATH TEST_MODE
 export K6_MODEL="${MODEL_SHORT}"
 export NO_CONNECTION_REUSE SERVER_DELAY_MS TIMEOUT SLEEP_MS FAIL_RATE_THRESHOLD P95_THRESHOLD_MS SUCCESS_RATE_THRESHOLD
 
 run_k6_job_manifest "${APP_NS}" "${JOB_NAME}" "${K6_SCRIPT}"
 
+msg "Waiting for k6 pod creation"
+
 POD_NAME="$(wait_k6_pod_created "${APP_NS}" "${JOB_NAME}")"
-
-msg "Waiting for k6 pod to start"
-
-POD_NAME=""
-
-for _ in $(seq 1 120); do
-  POD_NAME="$(kubectl get pods -n "${APP_NS}" -l job-name="${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-
-  if [[ -n "${POD_NAME}" ]]; then
-    break
-  fi
-
-  sleep 1
-done
 
 if [[ -z "${POD_NAME}" ]]; then
   warn "k6 pod was not created"

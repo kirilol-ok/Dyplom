@@ -10,11 +10,12 @@ spec:
     metadata:
       labels:
         app: k6
+        benchmark-role: load-generator
     spec:
       restartPolicy: Never
       containers:
         - name: k6
-          image: grafana/k6:0.51.0
+          image: grafana/k6:0.53.0
           imagePullPolicy: IfNotPresent
           command:
             - sh
@@ -42,6 +43,8 @@ spec:
               value: "__DURATION__"
             - name: TARGET_URL
               value: "__TARGET_URL__"
+            - name: TARGET_MODE
+              value: "__TARGET_MODE__"
             - name: RPS
               value: "__RPS__"
             - name: PAYLOAD_SIZE

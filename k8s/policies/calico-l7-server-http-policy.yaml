@@ -12,7 +12,7 @@ spec:
     - action: Allow
       protocol: TCP
       source:
-        selector: app == 'client'
+        selector: (app == 'client') || (benchmark-role == 'load-generator')
       destination:
         ports:
           - 8080
