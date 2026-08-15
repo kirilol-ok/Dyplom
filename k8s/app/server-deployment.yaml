@@ -2,8 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: server
-  labels:
-    app: server
 spec:
   replicas: 1
   selector:
@@ -13,29 +11,55 @@ spec:
     metadata:
       labels:
         app: server
+        benchmark-role: server
     spec:
+      serviceAccountName: benchmark-server
+      nodeSelector:
+        benchmark-role: application
       containers:
         - name: server
-          image: python:3.12-alpine
+          image: __BENCHMARK_APP_IMAGE__
           imagePullPolicy: IfNotPresent
-          command: ["python", "/app/server.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
           env:
             - name: PORT
               value: "8080"
-          ports:
-            - containerPort: 8080
-              name: http
+            - name: LOG_REQUESTS
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
           resources:
             requests:
-              cpu: 50m
+              cpu: 250m
               memory: 64Mi
             limits:
-              cpu: 500m
+              cpu: "2"
               memory: 256Mi
-          volumeMounts:
-            - name: app-code
-              mountPath: /app
-      volumes:
-        - name: app-code
-          configMap:
-            name: app-code
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault

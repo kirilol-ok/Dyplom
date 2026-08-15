@@ -1,0 +1,26 @@
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  controlPlaneReplicas: 1
+  controlPlaneNodeSelector:
+    benchmark-role: control-plane
+  calicoNetwork:
+    linuxDataplane: BPF
+    bpfNetworkBootstrap: Disabled
+    kubeProxyManagement: Disabled
+    bgp: Disabled
+    ipPools:
+      - name: default-ipv4-ippool
+        blockSize: 26
+        cidr: __POD_CIDR__
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}

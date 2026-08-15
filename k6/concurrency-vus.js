@@ -12,17 +12,8 @@ export const options = {
   noConnectionReuse: cfg.noConnectionReuse,
   summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
   thresholds: standardThresholds(false),
-  tags: {
-    profile: 'concurrency-vus',
-    model: cfg.model,
-  },
+  tags: { profile: 'concurrency-vus', model: cfg.model },
 };
 
-export default function () {
-  executeRequest(__ITER);
-  policyPause();
-}
-
-export function handleSummary(data) {
-  return makeSummary(data, 'concurrency-vus');
-}
+export default function () { executeRequest(__ITER); policyPause(); }
+export function handleSummary(data) { return makeSummary(data, 'concurrency-vus'); }

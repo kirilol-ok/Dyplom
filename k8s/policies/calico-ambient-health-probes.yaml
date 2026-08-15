@@ -1,20 +1,18 @@
 apiVersion: projectcalico.org/v3
 kind: NetworkPolicy
 metadata:
-  name: server-l4-allow-client
+  name: server-allow-ambient-health-probes
   namespace: __APP_NS__
 spec:
   selector: app == 'server'
   types:
     - Ingress
-    - Egress
   ingress:
     - action: Allow
       protocol: TCP
       source:
-        selector: (app == 'client') || (benchmark-role == 'load-generator')
+        nets:
+          - 169.254.7.127/32
       destination:
         ports:
           - 8080
-  egress:
-    - action: Allow

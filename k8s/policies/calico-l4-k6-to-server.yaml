@@ -1,0 +1,22 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: server-l4-allow-k6
+spec:
+  selector: app == 'server'
+  types:
+    - Ingress
+    - Egress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        selector: app == 'k6'
+        serviceAccounts:
+          names:
+            - benchmark-client
+      destination:
+        ports:
+          - 8080
+  egress:
+    - action: Allow

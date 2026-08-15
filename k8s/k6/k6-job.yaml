@@ -11,8 +11,18 @@ spec:
       labels:
         app: k6
         benchmark-role: load-generator
+      annotations:
+        sidecar.istio.io/nativeSidecar: "true"
     spec:
+      serviceAccountName: benchmark-client
       restartPolicy: Never
+      nodeSelector:
+        benchmark-role: load-generator
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: load-generator
+          effect: NoSchedule
       containers:
         - name: k6
           image: grafana/k6:0.53.0
@@ -22,14 +32,24 @@ spec:
             - -c
             - |
               set -u
+              echo "k6 container is ready; waiting for benchmark start signal"
+              while [ ! -f /results/.start ]; do
+                sleep 0.1
+              done
+              echo "benchmark start signal received"
               set +e
-              k6 run --out json=/results/k6-raw.json "/scripts/__K6_SCRIPT__"
+              k6 run "/scripts/__K6_SCRIPT__"
               code=$?
               set -e
+              if [ -s /results/summary.json ]; then
+                echo "k6 summary is ready"
+              else
+                echo "WARNING: k6 summary.json is missing or empty"
+              fi
+              echo "k6 finished with code ${code}; waiting for result collection"
               touch /results/.k6-finished
-              echo "k6 finished with code ${code}, waiting for result collection"
               i=0
-              while [ ! -f /results/.copied ] && [ "$i" -lt 600 ]; do
+              while [ ! -f /results/.copied ] && [ "$i" -lt 900 ]; do
                 i=$((i + 1))
                 sleep 1
               done
@@ -37,14 +57,14 @@ spec:
           env:
             - name: MODEL
               value: "__MODEL__"
-            - name: VUS
-              value: "__VUS__"
-            - name: DURATION
-              value: "__DURATION__"
             - name: TARGET_URL
               value: "__TARGET_URL__"
-            - name: TARGET_MODE
-              value: "__TARGET_MODE__"
+            - name: VUS
+              value: "__VUS__"
+            - name: MAX_VUS
+              value: "__MAX_VUS__"
+            - name: DURATION
+              value: "__DURATION__"
             - name: RPS
               value: "__RPS__"
             - name: PAYLOAD_SIZE
@@ -61,8 +81,8 @@ spec:
               value: "__NO_CONNECTION_REUSE__"
             - name: SERVER_DELAY_MS
               value: "__SERVER_DELAY_MS__"
-            - name: TIMEOUT
-              value: "__TIMEOUT__"
+            - name: REQUEST_TIMEOUT
+              value: "__REQUEST_TIMEOUT__"
             - name: SLEEP_MS
               value: "__SLEEP_MS__"
             - name: FAIL_RATE_THRESHOLD
@@ -71,9 +91,17 @@ spec:
               value: "__P95_THRESHOLD_MS__"
             - name: SUCCESS_RATE_THRESHOLD
               value: "__SUCCESS_RATE_THRESHOLD__"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              cpu: "8"
+              memory: 2Gi
           volumeMounts:
             - name: k6-scripts
               mountPath: /scripts
+              readOnly: true
             - name: results
               mountPath: /results
       volumes:
