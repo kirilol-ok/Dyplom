@@ -1,33 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
-MODEL="${1:-baseline}"
-CLUSTER="$(model_cluster "$MODEL")"
-use_cluster "$CLUSTER"
+
+[[ $# -eq 1 ]] || { echo "Usage: $0 <model>"; exit 1; }
+MODEL="$(canonical_model "$1")"
+CLUSTER_NAME="$(model_cluster "${MODEL}")"
+
+cluster_exists "${CLUSTER_NAME}" || die "Cluster does not exist: ${CLUSTER_NAME}"
+use_cluster "${CLUSTER_NAME}"
+
+echo "Model:   ${MODEL}"
+echo "Cluster: ${CLUSTER_NAME}"
+echo
+
 echo "== Nodes =="
-kubectl get nodes -L benchmark-role -o wide
+kubectl get nodes -o wide
+
 echo
-echo "== Workloads =="
-kubectl get pods -n "$APP_NS" -o wide
+echo "== Application =="
+kubectl get pods,svc -n "${APP_NS}" -o wide || true
+
 echo
-echo "== Server resources =="
-kubectl get deployment server -n "$APP_NS" -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].resources}{"\n"}'
+echo "== Calico policies in ${APP_NS} =="
+kubectl get networkpolicy.projectcalico.org -n "${APP_NS}" 2>/dev/null || echo "No Calico policy resources"
+
 echo
-echo "== Server Service and EndpointSlice =="
-kubectl get svc server -n "$APP_NS" -o wide
-kubectl get endpointslice -n "$APP_NS" -l kubernetes.io/service-name=server -o wide
+echo "== Kubernetes NetworkPolicy in ${APP_NS} =="
+kubectl get networkpolicy.networking.k8s.io -n "${APP_NS}" 2>/dev/null || echo "No Kubernetes NetworkPolicy resources"
+
 echo
-echo "== Calico benchmark policies =="
-kubectl get networkpolicies.projectcalico.org -n "$APP_NS" -o wide || true
+echo "== Istio AuthorizationPolicy in ${APP_NS} =="
+kubectl get authorizationpolicy.security.istio.io -n "${APP_NS}" 2>/dev/null || echo "No Istio AuthorizationPolicy resources"
+
 echo
-echo "== Calico installation =="
-kubectl get installation.operator.tigera.io default -o jsonpath='dataplane={.spec.calicoNetwork.linuxDataplane} bgp={.spec.calicoNetwork.bgp} encapsulation={.spec.calicoNetwork.ipPools[0].encapsulation}{"\n"}'
-kubectl get felixconfiguration default -o jsonpath='bpfConnectTimeLoadBalancing={.spec.bpfConnectTimeLoadBalancing} policySyncPathPrefix={.spec.policySyncPathPrefix}{"\n"}'
+echo "== Waypoints / Gateway API =="
+kubectl get gateway.gateway.networking.k8s.io -n "${APP_NS}" 2>/dev/null || echo "No waypoint Gateway resources"
+
 echo
-echo "== Tigera status =="
-kubectl get tigerastatus
-if [[ "$(model_short "$MODEL")" == l7-dikastes ]]; then
-  echo
-  echo "== Istio/Dikastes containers =="
-  kubectl get pods -n "$APP_NS" -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.initContainers[*].name}{" | "}{.spec.containers[*].name}{"\n"}{end}'
-fi
+echo "== Calico components =="
+kubectl get pods -n calico-system -o wide 2>/dev/null || true
+
+echo
+echo "== Istio components =="
+kubectl get pods -n istio-system -o wide 2>/dev/null || echo "Istio is not installed in this model"
+
+echo
+echo "== Namespace labels =="
+kubectl get namespace "${APP_NS}" --show-labels
+
+echo
+echo "== Felix settings relevant to the experiment =="
+kubectl get felixconfiguration default \
+  -o jsonpath='bpfConnectTimeLoadBalancing={.spec.bpfConnectTimeLoadBalancing} policySyncPathPrefix={.spec.policySyncPathPrefix}{"\n"}' \
+  2>/dev/null || true

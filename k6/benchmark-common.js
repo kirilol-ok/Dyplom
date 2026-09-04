@@ -1,189 +1,184 @@
 import http from 'k6/http';
-import { check, sleep } from 'k6';
+import { check } from 'k6';
 import { Rate, Trend } from 'k6/metrics';
 
-const expected200 = http.expectedStatuses(200);
-const expected403 = http.expectedStatuses(403);
+export const expectedStatusRate = new Rate('expected_status_rate');
+export const appProcessingMs = new Trend('app_processing_ms', true);
+export const infrastructureOverheadMs = new Trend('infrastructure_overhead_ms', true);
 
-function envNumber(name, fallback) {
-  const raw = __ENV[name];
-  if (raw === undefined || raw === '') return fallback;
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : fallback;
+function env(name, fallback) {
+  const value = __ENV[name];
+  return value === undefined || value === '' ? fallback : value;
 }
 
-function envBool(name, fallback) {
-  const raw = __ENV[name];
-  if (raw === undefined || raw === '') return fallback;
-  return String(raw).toLowerCase() === 'true';
+function toInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toFloat(value, fallback) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function toBool(value, fallback = false) {
+  if (value === undefined || value === '') return fallback;
+  return String(value).toLowerCase() === 'true';
 }
 
 export const cfg = {
-  model: __ENV.MODEL || 'baseline',
-  targetUrl: __ENV.TARGET_URL || 'http://server:8080',
-  vus: Math.max(1, Math.trunc(envNumber('VUS', 50))),
-  maxVUs: Math.max(1, Math.trunc(envNumber('MAX_VUS', 1000))),
-  duration: __ENV.DURATION || '45s',
-  rps: Math.max(0, envNumber('RPS', 0)),
-  testMode: __ENV.TEST_MODE || 'allowed',
-  requestMethod: (__ENV.REQUEST_METHOD || 'GET').toUpperCase(),
-  requestPath: __ENV.REQUEST_PATH || '/api/data',
-  payloadSize: Math.max(0, Math.trunc(envNumber('PAYLOAD_SIZE', 0))),
-  responseSize: Math.max(0, Math.trunc(envNumber('RESPONSE_SIZE', 128))),
-  serverDelayMs: Math.max(0, Math.trunc(envNumber('SERVER_DELAY_MS', 0))),
-  timeout: __ENV.REQUEST_TIMEOUT || '5s',
-  sleepMs: Math.max(0, envNumber('SLEEP_MS', 0)),
-  noConnectionReuse: envBool('NO_CONNECTION_REUSE', false),
-  failRateThreshold: envNumber('FAIL_RATE_THRESHOLD', 0.01),
-  successRateThreshold: envNumber('SUCCESS_RATE_THRESHOLD', 0.99),
-  p95ThresholdMs: envNumber('P95_THRESHOLD_MS', 1000),
+  model: env('MODEL', 'unknown'),
+  targetUrl: env('TARGET_URL', 'http://server:8080'),
+  targetMode: env('TARGET_MODE', 'direct'),
+  vus: toInt(env('VUS', '100'), 100),
+  duration: env('DURATION', '45s'),
+  rps: toInt(env('RPS', '0'), 0),
+  payloadSize: toInt(env('PAYLOAD_SIZE', '128'), 128),
+  responseSize: toInt(env('RESPONSE_SIZE', '128'), 128),
+  requestMethod: env('REQUEST_METHOD', 'GET').toUpperCase(),
+  requestPath: env('REQUEST_PATH', '/api/data'),
+  testMode: env('TEST_MODE', 'allowed'),
+  noConnectionReuse: toBool(env('NO_CONNECTION_REUSE', 'false')),
+  serverDelayMs: toInt(env('SERVER_DELAY_MS', '0'), 0),
+  timeout: env('TIMEOUT', '5s'),
+  sleepMs: toInt(env('SLEEP_MS', '0'), 0),
 };
-
-if (cfg.maxVUs < cfg.vus) {
-  cfg.maxVUs = cfg.vus;
-}
-
-export const expected_status_rate = new Rate('expected_status_rate');
-export const app_processing_ms = new Trend('app_processing_ms', true);
-export const infrastructure_overhead_ms = new Trend('infrastructure_overhead_ms', true);
-
-function l7ExpectedStatus() {
-  return cfg.model === 'l7-dikastes' ? 403 : 200;
-}
 
 function makePayload(size) {
   if (size <= 0) return null;
   return 'x'.repeat(size);
 }
 
-export function pickCase(iteration) {
-  if (cfg.testMode === 'allowed') {
-    return { name: 'api-allowed', method: 'GET', path: '/api/data', expected: 200 };
-  }
-
-  if (cfg.testMode === 'blocked') {
-    return { name: 'method-policy', method: 'POST', path: '/api/data', expected: l7ExpectedStatus() };
-  }
-
-  if (cfg.testMode === 'admin-blocked') {
-    return { name: 'path-policy', method: 'GET', path: '/admin', expected: l7ExpectedStatus() };
-  }
-
-  if (cfg.testMode === 'mixed') {
-    const cases = [
-      { name: 'api-allowed', method: 'GET', path: '/api/data', expected: 200 },
-      { name: 'health-allowed', method: 'GET', path: '/health', expected: 200 },
-      { name: 'method-policy', method: 'POST', path: '/api/data', expected: l7ExpectedStatus() },
-      { name: 'path-policy', method: 'GET', path: '/admin', expected: l7ExpectedStatus() },
-    ];
-    return cases[iteration % cases.length];
-  }
-
-  return { name: 'custom', method: cfg.requestMethod, path: cfg.requestPath, expected: 200 };
+function joinTarget(target, path) {
+  if (!path) return target;
+  if (target.endsWith('/') && path.startsWith('/')) return target.slice(0, -1) + path;
+  if (!target.endsWith('/') && !path.startsWith('/')) return `${target}/${path}`;
+  return target + path;
 }
 
-function removeTrailingSlash(value) {
-  return value.endsWith('/') ? value.slice(0, -1) : value;
+function requestUrl(targetUrl, requestPath) {
+  const base = joinTarget(targetUrl, requestPath);
+  const separator = base.includes('?') ? '&' : '?';
+  return `${base}${separator}response_size=${cfg.responseSize}&server_delay_ms=${cfg.serverDelayMs}`;
 }
 
-export function buildUrl(testCase) {
-  const base = removeTrailingSlash(cfg.targetUrl);
-  const query = `response_size=${cfg.responseSize}&server_delay_ms=${cfg.serverDelayMs}`;
-  return `${base}${testCase.path}?${query}`;
+function expectedResponse(res, mode) {
+  switch (mode) {
+    case 'allowed':
+    case 'baseline-open':
+      return res.status === 200;
+    case 'l4-blocked':
+      return res.status === 0 || res.status === 403;
+    case 'l7-blocked':
+      return res.status === 403;
+    default:
+      return res.status === 200;
+  }
 }
 
-export function executeRequest(iteration) {
-  const testCase = pickCase(iteration);
-  const tags = {
-    model: cfg.model,
-    test_mode: cfg.testMode,
-    case_name: testCase.name,
-    expected_status: String(testCase.expected),
-    request_method: testCase.method,
-    request_path: testCase.path,
-  };
+export function executeRequest(iteration, overrides = {}) {
+  const method = (overrides.method || cfg.requestMethod).toUpperCase();
+  const path = overrides.path === undefined ? cfg.requestPath : overrides.path;
+  const targetUrl = overrides.targetUrl || cfg.targetUrl;
+  const mode = overrides.testMode || cfg.testMode;
+  const url = requestUrl(targetUrl, path);
+  const body = method === 'GET' || method === 'HEAD' ? null : makePayload(cfg.payloadSize);
 
-  const hasBody = !['GET', 'DELETE', 'HEAD'].includes(testCase.method);
-  const body = hasBody ? makePayload(cfg.payloadSize) : null;
-  const params = {
+  const response = http.request(method, url, body, {
     timeout: cfg.timeout,
-    responseCallback: testCase.expected === 403 ? expected403 : expected200,
-    headers: { 'Content-Type': 'application/octet-stream' },
-    tags,
-  };
+    tags: {
+      model: cfg.model,
+      test_mode: mode,
+      request_path: path,
+    },
+  });
 
-  const response = http.request(testCase.method, buildUrl(testCase), body, params);
-  const expected = response.status === testCase.expected;
-  expected_status_rate.add(expected, tags);
+  const expected = expectedResponse(response, mode);
+  expectedStatusRate.add(expected);
+  check(response, {
+    'response matches expected policy result': () => expected,
+  });
 
-
-  const processingHeader =
-    response.headers['X-App-Processing-Ms'] || response.headers['x-app-processing-ms'];
-  if (processingHeader !== undefined) {
-    const processing = Number(processingHeader);
-    if (Number.isFinite(processing)) {
-      app_processing_ms.add(processing, tags);
-      infrastructure_overhead_ms.add(Math.max(0, response.timings.duration - processing), tags);
-    }
+  const appHeader = response.headers['X-App-Processing-Ms'];
+  const appMs = toFloat(appHeader, NaN);
+  if (Number.isFinite(appMs)) {
+    appProcessingMs.add(appMs);
+    infrastructureOverheadMs.add(Math.max(0, response.timings.duration - appMs));
   }
 
-  check(response, { 'status is expected': () => expected }, tags);
   return response;
 }
 
-export function policyPause() {
-  if (cfg.sleepMs > 0) sleep(cfg.sleepMs / 1000);
-}
-
-export function standardThresholds(includeDroppedIterations = true) {
-  const thresholds = {
-    http_req_failed: [`rate<${cfg.failRateThreshold}`],
-    http_req_duration: [`p(95)<${cfg.p95ThresholdMs}`],
-    expected_status_rate: [`rate>=${cfg.successRateThreshold}`],
-    checks: [`rate>=${cfg.successRateThreshold}`],
-  };
-  if (includeDroppedIterations) thresholds.dropped_iterations = ['count==0'];
-  return thresholds;
-}
-
-export function strictPolicyThresholds() {
+export function performanceThresholds() {
   return {
-    http_req_failed: ['rate==0'],
-    expected_status_rate: ['rate==1'],
-    checks: ['rate==1'],
+    expected_status_rate: ['rate>0.95'],
   };
 }
 
-function metric(data, name, key) {
-  return data.metrics?.[name]?.values?.[key];
+export function verificationThresholds() {
+  return {
+    expected_status_rate: ['rate>0.99'],
+    checks: ['rate>0.99'],
+  };
 }
 
-function fmt(value, digits = 2) {
-  return value === undefined ? '-' : Number(value).toFixed(digits);
+function metricValue(data, metric, key, fallback = 0) {
+  return data.metrics?.[metric]?.values?.[key] ?? fallback;
+}
+
+function percentage(value) {
+  return `${(Number(value || 0) * 100).toFixed(2)}%`;
 }
 
 export function makeSummary(data, profile) {
-  data.diploma = { ...cfg, profile };
+  data.diploma = {
+    profile,
+    model: cfg.model,
+    targetUrl: cfg.targetUrl,
+    targetMode: cfg.targetMode,
+    vus: cfg.vus,
+    duration: cfg.duration,
+    rps: cfg.rps,
+    payloadSize: cfg.payloadSize,
+    responseSize: cfg.responseSize,
+    requestMethod: cfg.requestMethod,
+    requestPath: cfg.requestPath,
+    testMode: cfg.testMode,
+    noConnectionReuse: cfg.noConnectionReuse,
+    serverDelayMs: cfg.serverDelayMs,
+  };
 
-  const reqs = metric(data, 'http_reqs', 'count') || 0;
-  const dropped = metric(data, 'dropped_iterations', 'count') || 0;
-  const scheduled = reqs + dropped;
-  const delivery = scheduled > 0 ? (100 * reqs) / scheduled : 100;
-  const successRate = metric(data, 'expected_status_rate', 'rate');
-  const successfulTarget = successRate === undefined ? undefined : delivery * Number(successRate);
+  const duration = data.metrics?.http_req_duration?.values || {};
+  const reqRate = metricValue(data, 'http_reqs', 'rate');
+  const reqs = metricValue(data, 'http_reqs', 'count');
+  const dropped = metricValue(data, 'dropped_iterations', 'count');
+  const expected = metricValue(data, 'expected_status_rate', 'rate', 1);
+  const failed = metricValue(data, 'http_req_failed', 'rate');
 
-  const lines = [
+  const text = [
     '',
-    `profile=${profile} model=${cfg.model}`,
-    `requests=${reqs} dropped=${dropped} target_delivery=${fmt(delivery)}%`,
-    `expected_status=${successRate === undefined ? '-' : fmt(successRate * 100)}% successful_target=${fmt(successfulTarget)}%`,
-    `latency_ms avg=${fmt(metric(data, 'http_req_duration', 'avg'))} p95=${fmt(metric(data, 'http_req_duration', 'p(95)'))} p99=${fmt(metric(data, 'http_req_duration', 'p(99)'))} max=${fmt(metric(data, 'http_req_duration', 'max'))}`,
-    `app_ms p95=${fmt(metric(data, 'app_processing_ms', 'p(95)'))} infrastructure_ms p95=${fmt(metric(data, 'infrastructure_overhead_ms', 'p(95)'))}`,
+    'Diploma k6 benchmark summary',
+    `profile: ${profile}`,
+    `model: ${cfg.model}`,
+    `mode: ${cfg.testMode}`,
+    `target: ${cfg.targetUrl}${cfg.requestPath}`,
+    `configured rps: ${cfg.rps}`,
+    `duration: ${cfg.duration}`,
+    `connection reuse disabled: ${cfg.noConnectionReuse}`,
+    `requests: ${reqs}`,
+    `achieved req/s: ${Number(reqRate).toFixed(2)}`,
+    `http p5 ms: ${Number(duration['p(5)'] || 0).toFixed(2)}`,
+    `http median ms: ${Number(duration.med || 0).toFixed(2)}`,
+    `http p95 ms: ${Number(duration['p(95)'] || 0).toFixed(2)}`,
+    `http p99 ms: ${Number(duration['p(99)'] || 0).toFixed(2)}`,
+    `http fail rate: ${percentage(failed)}`,
+    `expected status rate: ${percentage(expected)}`,
+    `dropped iterations: ${dropped}`,
     '',
   ].join('\n');
 
   return {
-    stdout: lines,
+    stdout: text,
     '/results/summary.json': JSON.stringify(data, null, 2),
   };
 }

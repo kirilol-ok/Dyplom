@@ -1,3 +1,6 @@
-.logs
-.tmp
-results
+.logs/
+.tmp/
+results/*
+!results/.gitkeep
+*.pyc
+__pycache__/

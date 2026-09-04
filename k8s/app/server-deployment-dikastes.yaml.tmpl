@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: server
+  template:
+    metadata:
+      labels:
+        app: server
+        benchmark-role: target
+      annotations:
+        inject.istio.io/templates: sidecar,dikastes
+    spec:
+      serviceAccountName: server
+      containers:
+        - name: server
+          image: __APP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: server
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: blocked-test
+              containerPort: 8081
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/health"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/health"]
+            initialDelaySeconds: 5
+            periodSeconds: 10

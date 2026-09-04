@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: __APP_NS__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+        benchmark-role: helper-client
+    spec:
+      serviceAccountName: client
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: server
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: client
+          image: __APP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: client
+            - name: UPSTREAM_URL
+              value: http://server:8080/api/data
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/health"]
+            initialDelaySeconds: 2
+            periodSeconds: 3

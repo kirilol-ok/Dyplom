@@ -1,0 +1,19 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: server-l7-allow-get
+  namespace: __APP_NS__
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: server
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods:
+              - GET
+            paths:
+              - /health
+              - /api/*

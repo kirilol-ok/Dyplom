@@ -1,0 +1,15 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: server-l4-allow-benchmark
+  namespace: __APP_NS__
+spec:
+  selector:
+    matchLabels:
+      app: server
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports:
+              - "8080"

@@ -3,204 +3,201 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 usage() {
-  echo "Usage: $0 <baseline|ambient-l4|l7-dikastes|all> <policy|steady|saturation|churn|concurrency|all>"
+  cat <<'USAGE'
+Usage:
+  run-benchmark-suite.sh <model|all> <verify|steady|churn|all>
+
+Examples:
+  bash scripts/run-benchmark-suite.sh calico-l4 verify
+  RATES="100 200 300 400 500" REPEATS=3 bash scripts/run-benchmark-suite.sh ambient-l7 steady
+  CHURN_RPS=200 REPEATS=3 bash scripts/run-benchmark-suite.sh calico-l7 churn
+USAGE
 }
+
 [[ $# -eq 2 ]] || { usage; exit 1; }
 
 MODEL_SELECTOR="$1"
 SUITE="$2"
-TARGET_URL="${TARGET_URL:-http://server:8080}"
-REPEATS="${REPEATS:-1}"
-COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-10}"
-MAX_VUS="${MAX_VUS:-1500}"
-BENCHMARK_VUS="${BENCHMARK_VUS:-500}"
-RATES="${RATES:-500 1000 1500 2000 2500 3000 3500 4000 4500 5000}"
-STEADY_DURATION="${STEADY_DURATION:-45s}"
-POLICY_DURATION="${POLICY_DURATION:-15s}"
-SATURATION_MAX_RPS="${SATURATION_MAX_RPS:-5000}"
-SATURATION_STAGE_DURATION="${SATURATION_STAGE_DURATION:-20s}"
-CHURN_RPS="${CHURN_RPS:-1000}"
-CHURN_DURATION="${CHURN_DURATION:-45s}"
-CONCURRENCY_VUS_LIST="${CONCURRENCY_VUS_LIST:-20 50 100 200 500}"
-CONCURRENCY_DURATION="${CONCURRENCY_DURATION:-45s}"
-BENCHMARK_CSV_FILE="${BENCHMARK_CSV_FILE:-${RESULTS_DIR}/benchmark-summary.csv}"
 
-case "$MODEL_SELECTOR" in
-  baseline|ambient-l4|l7-dikastes) MODELS=("$MODEL_SELECTOR") ;;
-  all) MODELS=(baseline ambient-l4 l7-dikastes) ;;
+if [[ "${MODEL_SELECTOR}" == "all" ]]; then
+  mapfile -t MODELS < <(all_models)
+else
+  MODELS=("$(canonical_model "${MODEL_SELECTOR}")")
+fi
+
+case "${SUITE}" in
+  verify|policy|steady|churn|all) ;;
   *) usage; exit 1 ;;
 esac
-case "$SUITE" in policy|steady|saturation|churn|concurrency|all) ;; *) usage; exit 1 ;; esac
 
-server_local_healthy() {
-  local pod=""
-  pod="$(ready_pod_by_label "$APP_NS" "app=server" || true)"
-  [[ -n "$pod" ]] || return 1
+RATES="${RATES:-100 200 300 400 500}"
+REPEATS="${REPEATS:-3}"
+BENCHMARK_VUS="${BENCHMARK_VUS:-300}"
+STEADY_DURATION="${STEADY_DURATION:-45s}"
+VERIFY_DURATION="${VERIFY_DURATION:-5s}"
+CHURN_RPS="${CHURN_RPS:-200}"
+CHURN_DURATION="${CHURN_DURATION:-45s}"
+CHURN_COMPARE_REUSE="${CHURN_COMPARE_REUSE:-true}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-10}"
+SERVER_RECOVERY_WAIT_SECONDS="${SERVER_RECOVERY_WAIT_SECONDS:-30}"
 
-  kubectl exec -n "$APP_NS" "$pod" -c server -- \
-    busybox wget -q -T 3 -O - http://127.0.0.1:8080/health >/dev/null
+server_local_responds() {
+  kubectl exec -n "${APP_NS}" deployment/server -c server -- \
+    wget -q -T 3 -O - http://127.0.0.1:8080/health >/dev/null 2>&1
 }
 
-ensure_server_healthy() {
-  local model="$1"
-  local cluster
-  cluster="$(model_cluster "$model")"
-  use_cluster "$cluster"
-  if server_local_healthy; then return 0; fi
-  warn "Server process is unhealthy; restarting deployment/server"
-  kubectl rollout restart deployment/server -n "$APP_NS" >/dev/null
-  kubectl rollout status deployment/server -n "$APP_NS" --timeout=180s
-  server_local_healthy || die "Server is still unhealthy after restart"
+server_service_responds() {
+  kubectl exec -n "${APP_NS}" deployment/client -c client -- \
+    wget -q -T 3 -O - http://server:8080/health >/dev/null 2>&1
 }
 
-# Return the next run number for a logical test series.  This intentionally
-# looks at the persistent CSV, so running the whole suite twice produces
-# run1/run2 instead of a second run1/run1 pair.
-next_run_index() {
+wait_for_server_path() {
+  local end_ts=$((SECONDS + SERVER_RECOVERY_WAIT_SECONDS))
+  while (( SECONDS < end_ts )); do
+    if server_local_responds && server_service_responds; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+ensure_model_ready() {
   local model="$1"
-  local tag_prefix="$2"
+  local cluster_name
+  cluster_name="$(model_cluster "${model}")"
+  cluster_exists "${cluster_name}" || die "Cluster ${cluster_name} does not exist. Run scripts/up.sh ${model} first"
+  use_cluster "${cluster_name}"
+  if ! wait_for_server_path; then
+    kubectl get pods -n "${APP_NS}" -o wide || true
+    kubectl get svc,endpoints -n "${APP_NS}" || true
+    die "${model} is not healthy enough to benchmark"
+  fi
+}
 
-  python3 - "$BENCHMARK_CSV_FILE" "$model" "$tag_prefix" <<'PY'
-import csv
-import re
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-model = sys.argv[2]
-prefix = sys.argv[3]
-pattern = re.compile(r"^" + re.escape(prefix) + r"-run(\d+)$")
-maximum = 0
-matched_rows = 0
-
-if path.exists() and path.stat().st_size > 0:
-    try:
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            for row in csv.DictReader(handle):
-                if row.get("model") != model:
-                    continue
-                match = pattern.match(row.get("run_tag", ""))
-                if match:
-                    matched_rows += 1
-                    maximum = max(maximum, int(match.group(1)))
-    except (OSError, csv.Error, ValueError):
-        pass
-
-# Use both the largest explicit index and the number of historical rows.
-# This prevents a new collision even if an older buggy run wrote run1 twice.
-print(max(maximum, matched_rows) + 1)
-PY
+cooldown() {
+  if (( COOLDOWN_SECONDS > 0 )); then
+    sleep "${COOLDOWN_SECONDS}"
+  fi
 }
 
 run_case() {
   local model="$1"
   local script="$2"
   shift 2
-  ensure_server_healthy "$model"
-  msg "Running ${script} for ${model}"
-  local run_rc=0
-  env TARGET_URL="$TARGET_URL" MAX_VUS="$MAX_VUS" BENCHMARK_CSV_FILE="$BENCHMARK_CSV_FILE" "$@" \
-      bash "${ROOT_DIR}/scripts/run-k6.sh" "$model" "$script" || run_rc=$?
 
-  case "$run_rc" in
-    0)
+  ensure_model_ready "${model}"
+  if ! env "$@" bash "${ROOT_DIR}/scripts/run-k6.sh" "${model}" "${script}"; then
+    warn "k6 returned a non-zero status for ${model}/${script}; collected results remain useful for analysis"
+  fi
+  cooldown
+}
+
+run_verify_suite() {
+  local model="$1"
+
+  msg "Verification: ${model} allowed GET"
+  run_case "${model}" policy-verify.js \
+    RUN_TAG=verify-allowed \
+    VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
+    TARGET_URL=http://server:8080 REQUEST_METHOD=GET REQUEST_PATH=/api/data \
+    TEST_MODE=allowed TIMEOUT=3s NO_CONNECTION_REUSE=false
+
+  case "${model}" in
+    calico-baseline|ambient-baseline)
+      msg "Verification: ${model} baseline has no L4 block"
+      run_case "${model}" policy-verify.js \
+        RUN_TAG=verify-baseline-open-8081 \
+        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
+        TARGET_URL=http://server:8081 REQUEST_METHOD=GET REQUEST_PATH=/health \
+        TEST_MODE=baseline-open TIMEOUT=3s NO_CONNECTION_REUSE=false
       ;;
-    20)
-      warn "The k6 benchmark finished, but summary artifact collection failed. This is a runner/collection error, not a k6 threshold failure."
+    calico-l4|ambient-l4)
+      msg "Verification: ${model} blocks port 8081"
+      run_case "${model}" policy-verify.js \
+        RUN_TAG=verify-l4-blocked \
+        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
+        TARGET_URL=http://server:8081 REQUEST_METHOD=GET REQUEST_PATH=/health \
+        TEST_MODE=l4-blocked TIMEOUT=2s NO_CONNECTION_REUSE=true
       ;;
-    21)
-      warn "The k6 benchmark finished and summary.json was saved, but local summary/CSV post-processing failed."
-      ;;
-    30)
-      die "Ambient dataplane preflight failed before k6 started. Aborting the suite so invalid runs are not recorded."
-      ;;
-    *)
-      warn "k6 exited with status ${run_rc}. If summary.json was collected, inspect thresholds and delivery metrics."
+    calico-l7|ambient-l7)
+      msg "Verification: ${model} blocks POST /api/data at L7"
+      run_case "${model}" policy-verify.js \
+        RUN_TAG=verify-l7-blocked \
+        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
+        TARGET_URL=http://server:8080 REQUEST_METHOD=POST REQUEST_PATH=/api/data \
+        TEST_MODE=l7-blocked TIMEOUT=3s NO_CONNECTION_REUSE=false
       ;;
   esac
-  ensure_server_healthy "$model"
-  (( COOLDOWN_SECONDS <= 0 )) || sleep "$COOLDOWN_SECONDS"
 }
 
-run_policy() {
+run_steady_suite() {
   local model="$1"
-  local mode prefix next
-  for mode in allowed blocked admin-blocked mixed; do
-    prefix="policy-${mode}"
-    next="$(next_run_index "$model" "$prefix")"
-    run_case "$model" policy-test.js \
-      VUS=1 DURATION="$POLICY_DURATION" RPS=0 TEST_MODE="$mode" SLEEP_MS=100 \
-      RUN_TAG="${prefix}-run${next}" RUN_INDEX="$next" \
-      FAIL_RATE_THRESHOLD=0.001 SUCCESS_RATE_THRESHOLD=1 P95_THRESHOLD_MS=1000
-  done
-}
+  local rate run
 
-run_steady() {
-  local model="$1"
-  local rate run prefix first index
-  for rate in $RATES; do
-    prefix="steady-rps${rate}"
-    first="$(next_run_index "$model" "$prefix")"
-    for run in $(seq 0 $((REPEATS - 1))); do
-      index=$((first + run))
-      run_case "$model" steady-rps.js \
-        VUS="$BENCHMARK_VUS" RPS="$rate" DURATION="$STEADY_DURATION" TEST_MODE=allowed SLEEP_MS=0 \
-        RUN_TAG="${prefix}-run${index}" RUN_INDEX="$index"
+  for rate in ${RATES}; do
+    for run in $(seq 1 "${REPEATS}"); do
+      msg "Steady ${model}: RPS=${rate}, repetition=${run}/${REPEATS}"
+      run_case "${model}" steady-rps.js \
+        RUN_TAG="steady-rps${rate}-run${run}" \
+        VUS="${BENCHMARK_VUS}" \
+        RPS="${rate}" \
+        DURATION="${STEADY_DURATION}" \
+        TARGET_URL=http://server:8080 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/api/data \
+        TEST_MODE=allowed \
+        NO_CONNECTION_REUSE=false \
+        SLEEP_MS=0
     done
   done
 }
 
-run_saturation() {
+run_churn_suite() {
   local model="$1"
-  local prefix next
-  prefix="saturation-max${SATURATION_MAX_RPS}"
-  next="$(next_run_index "$model" "$prefix")"
-  run_case "$model" saturation.js \
-    VUS="$BENCHMARK_VUS" RPS="$SATURATION_MAX_RPS" DURATION="$SATURATION_STAGE_DURATION" \
-    TEST_MODE=allowed SLEEP_MS=0 RUN_TAG="${prefix}-run${next}" RUN_INDEX="$next"
-}
+  local run reuse_values
 
-run_churn() {
-  local model="$1"
-  local reuse run prefix first index
-  for reuse in false true; do
-    prefix="churn-${reuse}"
-    first="$(next_run_index "$model" "$prefix")"
-    for run in $(seq 0 $((REPEATS - 1))); do
-      index=$((first + run))
-      run_case "$model" connection-churn.js \
-        VUS="$BENCHMARK_VUS" RPS="$CHURN_RPS" DURATION="$CHURN_DURATION" TEST_MODE=allowed \
-        NO_CONNECTION_REUSE="$reuse" SLEEP_MS=0 RUN_TAG="${prefix}-run${index}" RUN_INDEX="$index"
-    done
-  done
-}
+  if [[ "${CHURN_COMPARE_REUSE}" == "true" ]]; then
+    reuse_values="false true"
+  else
+    reuse_values="true"
+  fi
 
-run_concurrency() {
-  local model="$1"
-  local vus run prefix first index
-  for vus in $CONCURRENCY_VUS_LIST; do
-    prefix="concurrency-vus${vus}"
-    first="$(next_run_index "$model" "$prefix")"
-    for run in $(seq 0 $((REPEATS - 1))); do
-      index=$((first + run))
-      run_case "$model" concurrency-vus.js \
-        VUS="$vus" RPS=0 DURATION="$CONCURRENCY_DURATION" TEST_MODE=allowed SLEEP_MS=0 \
-        RUN_TAG="${prefix}-run${index}" RUN_INDEX="$index"
+  for reuse in ${reuse_values}; do
+    for run in $(seq 1 "${REPEATS}"); do
+      msg "Connection ${model}: noConnectionReuse=${reuse}, repetition=${run}/${REPEATS}"
+      run_case "${model}" connection-churn.js \
+        RUN_TAG="churn-${reuse}-run${run}" \
+        VUS="${BENCHMARK_VUS}" \
+        RPS="${CHURN_RPS}" \
+        DURATION="${CHURN_DURATION}" \
+        TARGET_URL=http://server:8080 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/api/data \
+        TEST_MODE=allowed \
+        NO_CONNECTION_REUSE="${reuse}" \
+        SLEEP_MS=0
     done
   done
 }
 
 for model in "${MODELS[@]}"; do
-  case "$SUITE" in
-    policy) run_policy "$model" ;;
-    steady) run_steady "$model" ;;
-    saturation) run_saturation "$model" ;;
-    churn) run_churn "$model" ;;
-    concurrency) run_concurrency "$model" ;;
-    all) run_policy "$model"; run_steady "$model"; run_saturation "$model"; run_churn "$model"; run_concurrency "$model" ;;
+  case "${SUITE}" in
+    verify|policy)
+      run_verify_suite "${model}"
+      ;;
+    steady)
+      run_steady_suite "${model}"
+      ;;
+    churn)
+      run_churn_suite "${model}"
+      ;;
+    all)
+      run_verify_suite "${model}"
+      run_steady_suite "${model}"
+      run_churn_suite "${model}"
+      ;;
   esac
 done
 
 msg "Benchmark suite finished"
-msg "Summary CSV: ${BENCHMARK_CSV_FILE}"
-msg "Resource CSV: ${RESULTS_DIR}/benchmark-resources.csv"

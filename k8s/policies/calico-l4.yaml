@@ -1,0 +1,15 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: server-l4-allow-benchmark
+  namespace: __APP_NS__
+spec:
+  selector: app == 'server'
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports:
+          - 8080

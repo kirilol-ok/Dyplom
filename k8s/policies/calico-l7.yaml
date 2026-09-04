@@ -1,0 +1,28 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: server-l7-http-allow
+  namespace: __APP_NS__
+spec:
+  selector: app == 'server'
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports:
+          - 15020
+          - 15021
+          - 15090
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports:
+          - 8080
+      http:
+        methods:
+          - GET
+        paths:
+          - exact: /health
+          - prefix: /api/

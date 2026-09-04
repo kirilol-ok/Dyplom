@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: server
+  namespace: __APP_NS__
 spec:
   replicas: 1
   selector:
@@ -11,58 +12,37 @@ spec:
     metadata:
       labels:
         app: server
-        benchmark-role: server
+        benchmark-role: target
       annotations:
         inject.istio.io/templates: sidecar,dikastes
-        sidecar.istio.io/nativeSidecar: "true"
     spec:
-      serviceAccountName: benchmark-server
-      nodeSelector:
-        benchmark-role: application
+      serviceAccountName: server
       containers:
         - name: server
-          image: __BENCHMARK_APP_IMAGE__
+          image: __APP_IMAGE__
           imagePullPolicy: IfNotPresent
+          env:
+            - name: ROLE
+              value: server
           ports:
             - name: http
               containerPort: 8080
-              protocol: TCP
-          env:
-            - name: PORT
-              value: "8080"
-            - name: LOG_REQUESTS
-              value: "false"
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 1
-            periodSeconds: 2
-            timeoutSeconds: 1
-            failureThreshold: 15
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 6
+            - name: blocked-test
+              containerPort: 8081
           resources:
             requests:
-              cpu: 250m
+              cpu: 50m
               memory: 64Mi
             limits:
-              cpu: "2"
+              cpu: 500m
               memory: 256Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 10001
-            runAsGroup: 10001
-            capabilities:
-              drop: ["ALL"]
-      securityContext:
-        seccompProfile:
-          type: RuntimeDefault
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/health"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/health"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
