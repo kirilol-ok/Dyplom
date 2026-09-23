@@ -1,4 +1,10 @@
-import { cfg, executeRequest, makeSummary, policyPause, standardThresholds } from './benchmark-common.js';
+import { sleep } from 'k6';
+import {
+  cfg,
+  executeRequest,
+  makeSummary,
+  performanceThresholds,
+} from './benchmark-common.js';
 
 export const options = {
   scenarios: {
@@ -9,11 +15,35 @@ export const options = {
       gracefulStop: '10s',
     },
   },
+
   noConnectionReuse: cfg.noConnectionReuse,
-  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
-  thresholds: standardThresholds(false),
-  tags: { profile: 'concurrency-vus', model: cfg.model },
+
+  summaryTrendStats: [
+    'avg',
+    'p(5)',
+    'med',
+    'p(90)',
+    'p(95)',
+    'p(99)',
+    'max',
+  ],
+
+  thresholds: performanceThresholds(),
+
+  tags: {
+    profile: 'concurrency-vus',
+    model: cfg.model,
+  },
 };
 
-export default function () { executeRequest(__ITER); policyPause(); }
-export function handleSummary(data) { return makeSummary(data, 'concurrency-vus'); }
+export default function () {
+  executeRequest(__ITER);
+
+  if (cfg.sleepMs > 0) {
+    sleep(cfg.sleepMs / 1000);
+  }
+}
+
+export function handleSummary(data) {
+  return makeSummary(data, 'concurrency-vus');
+}

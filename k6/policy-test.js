@@ -1,4 +1,10 @@
-import { cfg, executeRequest, makeSummary, policyPause, strictPolicyThresholds } from './benchmark-common.js';
+import { sleep } from 'k6';
+import {
+  cfg,
+  executeRequest,
+  makeSummary,
+  verificationThresholds,
+} from './benchmark-common.js';
 
 export const options = {
   scenarios: {
@@ -9,11 +15,34 @@ export const options = {
       gracefulStop: '5s',
     },
   },
+
   noConnectionReuse: cfg.noConnectionReuse,
-  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
-  thresholds: strictPolicyThresholds(),
-  tags: { profile: 'policy', model: cfg.model },
+
+  summaryTrendStats: [
+    'avg',
+    'p(5)',
+    'med',
+    'p(90)',
+    'p(95)',
+    'p(99)',
+    'max',
+  ],
+
+  thresholds: verificationThresholds(),
+
+  tags: {
+    profile: 'policy',
+    model: cfg.model,
+  },
 };
 
-export default function () { executeRequest(__ITER); policyPause(); }
-export function handleSummary(data) { return makeSummary(data, 'policy'); }
+export default function () {
+  executeRequest(__ITER);
+
+  const pauseMs = cfg.sleepMs > 0 ? cfg.sleepMs : 200;
+  sleep(pauseMs / 1000);
+}
+
+export function handleSummary(data) {
+  return makeSummary(data, 'policy');
+}

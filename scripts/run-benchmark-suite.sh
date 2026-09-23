@@ -5,12 +5,29 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 usage() {
   cat <<'USAGE'
 Usage:
-  run-benchmark-suite.sh <model|all> <verify|steady|churn|all>
+  run-benchmark-suite.sh <model|all> <verify|steady|churn|concurrency|saturation|all>
 
 Examples:
   bash scripts/run-benchmark-suite.sh calico-l4 verify
-  RATES="100 200 300 400 500" REPEATS=3 bash scripts/run-benchmark-suite.sh ambient-l7 steady
-  CHURN_RPS=200 REPEATS=3 bash scripts/run-benchmark-suite.sh calico-l7 churn
+
+  RATES="100 200 300 400 500" \
+  REPEATS=3 \
+  bash scripts/run-benchmark-suite.sh ambient-l7 steady
+
+  CHURN_RPS=200 \
+  REPEATS=3 \
+  bash scripts/run-benchmark-suite.sh calico-l7 churn
+
+  VUS_LEVELS="5 10 20 40 80 120 160" \
+  REPEATS=3 \
+  CONCURRENCY_DURATION=45s \
+  bash scripts/run-benchmark-suite.sh calico-baseline concurrency
+
+  SATURATION_RATES="1000 1250 1500 1750 2000 2250" \
+  SATURATION_VUS=1000 \
+  REPEATS=1 \
+  SATURATION_DURATION=30s \
+  bash scripts/run-benchmark-suite.sh calico-baseline saturation
 USAGE
 }
 
@@ -26,7 +43,7 @@ else
 fi
 
 case "${SUITE}" in
-  verify|policy|steady|churn|all) ;;
+  verify|policy|steady|churn|concurrency|saturation|all) ;;
   *) usage; exit 1 ;;
 esac
 
@@ -35,9 +52,19 @@ REPEATS="${REPEATS:-3}"
 BENCHMARK_VUS="${BENCHMARK_VUS:-300}"
 STEADY_DURATION="${STEADY_DURATION:-45s}"
 VERIFY_DURATION="${VERIFY_DURATION:-5s}"
+
 CHURN_RPS="${CHURN_RPS:-200}"
 CHURN_DURATION="${CHURN_DURATION:-45s}"
 CHURN_COMPARE_REUSE="${CHURN_COMPARE_REUSE:-true}"
+
+VUS_LEVELS="${VUS_LEVELS:-5 10 20 40 80}"
+CONCURRENCY_DURATION="${CONCURRENCY_DURATION:-45s}"
+CONCURRENCY_SLEEP_MS="${CONCURRENCY_SLEEP_MS:-100}"
+
+SATURATION_RATES="${SATURATION_RATES:-1000 1250 1500 1750 2000 2250}"
+SATURATION_VUS="${SATURATION_VUS:-1000}"
+SATURATION_DURATION="${SATURATION_DURATION:-30s}"
+
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-10}"
 SERVER_RECOVERY_WAIT_SECONDS="${SERVER_RECOVERY_WAIT_SECONDS:-30}"
 
@@ -53,21 +80,29 @@ server_service_responds() {
 
 wait_for_server_path() {
   local end_ts=$((SECONDS + SERVER_RECOVERY_WAIT_SECONDS))
+
   while (( SECONDS < end_ts )); do
     if server_local_responds && server_service_responds; then
       return 0
     fi
+
     sleep 2
   done
+
   return 1
 }
 
 ensure_model_ready() {
   local model="$1"
   local cluster_name
+
   cluster_name="$(model_cluster "${model}")"
-  cluster_exists "${cluster_name}" || die "Cluster ${cluster_name} does not exist. Run scripts/up.sh ${model} first"
+
+  cluster_exists "${cluster_name}" || \
+    die "Cluster ${cluster_name} does not exist. Run scripts/up.sh ${model} first"
+
   use_cluster "${cluster_name}"
+
   if ! wait_for_server_path; then
     kubectl get pods -n "${APP_NS}" -o wide || true
     kubectl get svc,endpoints -n "${APP_NS}" || true
@@ -84,12 +119,15 @@ cooldown() {
 run_case() {
   local model="$1"
   local script="$2"
+
   shift 2
 
   ensure_model_ready "${model}"
+
   if ! env "$@" bash "${ROOT_DIR}/scripts/run-k6.sh" "${model}" "${script}"; then
     warn "k6 returned a non-zero status for ${model}/${script}; collected results remain useful for analysis"
   fi
+
   cooldown
 }
 
@@ -97,47 +135,79 @@ run_verify_suite() {
   local model="$1"
 
   msg "Verification: ${model} allowed GET"
+
   run_case "${model}" policy-verify.js \
     RUN_TAG=verify-allowed \
-    VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
-    TARGET_URL=http://server:8080 REQUEST_METHOD=GET REQUEST_PATH=/api/data \
-    TEST_MODE=allowed TIMEOUT=3s NO_CONNECTION_REUSE=false
+    VUS=1 \
+    DURATION="${VERIFY_DURATION}" \
+    RPS=0 \
+    TARGET_URL=http://server:8080 \
+    REQUEST_METHOD=GET \
+    REQUEST_PATH=/api/data \
+    TEST_MODE=allowed \
+    TIMEOUT=3s \
+    NO_CONNECTION_REUSE=false
 
   case "${model}" in
     calico-baseline|ambient-baseline)
       msg "Verification: ${model} baseline has no L4 block"
+
       run_case "${model}" policy-verify.js \
         RUN_TAG=verify-baseline-open-8081 \
-        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
-        TARGET_URL=http://server:8081 REQUEST_METHOD=GET REQUEST_PATH=/health \
-        TEST_MODE=baseline-open TIMEOUT=3s NO_CONNECTION_REUSE=false
+        VUS=1 \
+        DURATION="${VERIFY_DURATION}" \
+        RPS=0 \
+        TARGET_URL=http://server:8081 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/health \
+        TEST_MODE=baseline-open \
+        TIMEOUT=3s \
+        NO_CONNECTION_REUSE=false
       ;;
+
     calico-l4|ambient-l4)
       msg "Verification: ${model} blocks port 8081"
+
       run_case "${model}" policy-verify.js \
         RUN_TAG=verify-l4-blocked \
-        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
-        TARGET_URL=http://server:8081 REQUEST_METHOD=GET REQUEST_PATH=/health \
-        TEST_MODE=l4-blocked TIMEOUT=2s NO_CONNECTION_REUSE=true
+        VUS=1 \
+        DURATION="${VERIFY_DURATION}" \
+        RPS=0 \
+        TARGET_URL=http://server:8081 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/health \
+        TEST_MODE=l4-blocked \
+        TIMEOUT=2s \
+        NO_CONNECTION_REUSE=true
       ;;
+
     calico-l7|ambient-l7)
       msg "Verification: ${model} blocks POST /api/data at L7"
+
       run_case "${model}" policy-verify.js \
         RUN_TAG=verify-l7-blocked \
-        VUS=1 DURATION="${VERIFY_DURATION}" RPS=0 \
-        TARGET_URL=http://server:8080 REQUEST_METHOD=POST REQUEST_PATH=/api/data \
-        TEST_MODE=l7-blocked TIMEOUT=3s NO_CONNECTION_REUSE=false
+        VUS=1 \
+        DURATION="${VERIFY_DURATION}" \
+        RPS=0 \
+        TARGET_URL=http://server:8080 \
+        REQUEST_METHOD=POST \
+        REQUEST_PATH=/api/data \
+        TEST_MODE=l7-blocked \
+        TIMEOUT=3s \
+        NO_CONNECTION_REUSE=false
       ;;
   esac
 }
 
 run_steady_suite() {
   local model="$1"
-  local rate run
+  local rate
+  local run
 
   for rate in ${RATES}; do
     for run in $(seq 1 "${REPEATS}"); do
       msg "Steady ${model}: RPS=${rate}, repetition=${run}/${REPEATS}"
+
       run_case "${model}" steady-rps.js \
         RUN_TAG="steady-rps${rate}-run${run}" \
         VUS="${BENCHMARK_VUS}" \
@@ -155,7 +225,9 @@ run_steady_suite() {
 
 run_churn_suite() {
   local model="$1"
-  local run reuse_values
+  local run
+  local reuse
+  local reuse_values
 
   if [[ "${CHURN_COMPARE_REUSE}" == "true" ]]; then
     reuse_values="false true"
@@ -166,6 +238,7 @@ run_churn_suite() {
   for reuse in ${reuse_values}; do
     for run in $(seq 1 "${REPEATS}"); do
       msg "Connection ${model}: noConnectionReuse=${reuse}, repetition=${run}/${REPEATS}"
+
       run_case "${model}" connection-churn.js \
         RUN_TAG="churn-${reuse}-run${run}" \
         VUS="${BENCHMARK_VUS}" \
@@ -181,21 +254,82 @@ run_churn_suite() {
   done
 }
 
+run_concurrency_suite() {
+  local model="$1"
+  local vus
+  local run
+
+  for vus in ${VUS_LEVELS}; do
+    for run in $(seq 1 "${REPEATS}"); do
+      msg "Concurrency ${model}: VUS=${vus}, repetition=${run}/${REPEATS}"
+
+      run_case "${model}" concurrency-vus.js \
+        RUN_TAG="concurrency-vus${vus}-run${run}" \
+        VUS="${vus}" \
+        RPS=0 \
+        DURATION="${CONCURRENCY_DURATION}" \
+        TARGET_URL=http://server:8080 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/api/data \
+        TEST_MODE=allowed \
+        NO_CONNECTION_REUSE=false \
+        SLEEP_MS="${CONCURRENCY_SLEEP_MS}"
+    done
+  done
+}
+
+run_saturation_suite() {
+  local model="$1"
+  local rate
+  local run
+
+  for rate in ${SATURATION_RATES}; do
+    for run in $(seq 1 "${REPEATS}"); do
+      msg "Saturation ${model}: RPS=${rate}, repetition=${run}/${REPEATS}"
+
+      run_case "${model}" saturation.js \
+        RUN_TAG="saturation-rps${rate}-run${run}" \
+        VUS="${SATURATION_VUS}" \
+        RPS="${rate}" \
+        DURATION="${SATURATION_DURATION}" \
+        TARGET_URL=http://server:8080 \
+        REQUEST_METHOD=GET \
+        REQUEST_PATH=/api/data \
+        TEST_MODE=allowed \
+        NO_CONNECTION_REUSE=false \
+        SLEEP_MS=0
+    done
+  done
+}
+
 for model in "${MODELS[@]}"; do
   case "${SUITE}" in
     verify|policy)
       run_verify_suite "${model}"
       ;;
+
     steady)
       run_steady_suite "${model}"
       ;;
+
     churn)
       run_churn_suite "${model}"
       ;;
+
+    concurrency)
+      run_concurrency_suite "${model}"
+      ;;
+
+    saturation)
+      run_saturation_suite "${model}"
+      ;;
+
     all)
       run_verify_suite "${model}"
       run_steady_suite "${model}"
       run_churn_suite "${model}"
+      run_concurrency_suite "${model}"
+      run_saturation_suite "${model}"
       ;;
   esac
 done
