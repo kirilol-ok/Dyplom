@@ -1,0 +1,141 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: server-l7-spaghetti-deny
+  namespace: __APP_NS__
+  annotations:
+    benchmark.diploma/policy-variant: spaghetti
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: server
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            methods: [DELETE]
+            paths: [/api/*]
+    - to:
+        - operation:
+            methods: [PATCH]
+            paths: [/admin/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/internal/*]
+    - to:
+        - operation:
+            methods: [PUT]
+            paths: [/reports/private/*]
+    - to:
+        - operation:
+            methods: [TRACE]
+            paths: [/*]
+    - to:
+        - operation:
+            methods: [CONNECT]
+            paths: [/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/api/data]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/admin, /admin/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/reports/export]
+    - to:
+        - operation:
+            methods: [PUT]
+            paths: [/api/settings]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: server-l7-allow-get
+  namespace: __APP_NS__
+  annotations:
+    benchmark.diploma/policy-variant: spaghetti
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: server
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/health]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/api/import]
+    - to:
+        - operation:
+            methods: [PUT]
+            paths: [/api/settings]
+    - to:
+        - operation:
+            methods: [PATCH]
+            paths: [/api/profile/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/assets/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/reports/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/api/v9/archive]
+    - to:
+        - operation:
+            methods: [HEAD]
+            paths: [/api/*]
+    - to:
+        - operation:
+            methods: [OPTIONS]
+            paths: [/api/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/public/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/status/ready, /status/live]
+    - to:
+        - operation:
+            methods: [PUT]
+            paths: [/jobs/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/events/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/internal/version]
+    - to:
+        - operation:
+            methods: [PATCH]
+            paths: [/internal/flags]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/downloads/*]
+    - to:
+        - operation:
+            methods: [POST]
+            paths: [/uploads/*]
+    - to:
+        - operation:
+            methods: [GET]
+            paths: [/api/*]

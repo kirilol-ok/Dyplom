@@ -56,11 +56,22 @@ def append_rows(path, rows):
     exists = path.exists() and path.stat().st_size > 0
     if exists:
         with path.open(newline="", encoding="utf-8") as handle:
-            existing = next(csv.reader(handle), [])
+            reader = csv.DictReader(handle)
+            existing = reader.fieldnames or []
+            existing_rows = list(reader)
         if existing != fieldnames:
-            raise SystemExit(
-                f"CSV schema mismatch in {path}. Move the old file away before mixing v1 and v2 results."
-            )
+            unknown = [name for name in existing if name not in fieldnames]
+            if unknown:
+                raise SystemExit(
+                    f"CSV schema mismatch in {path}. Unknown existing columns: {', '.join(unknown)}"
+                )
+
+            temporary = path.with_name(f".{path.name}.schema-upgrade.tmp")
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(existing_rows)
+            temporary.replace(path)
 
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -72,11 +83,11 @@ def append_rows(path, rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
-    parser.add_argument("output")
     parser.add_argument("--master", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--scenario-variant", default="default")
     parser.add_argument("--rps", required=True)
     parser.add_argument("--no-connection-reuse", required=True)
     args = parser.parse_args()
@@ -122,6 +133,7 @@ def main():
             "run_id": args.run_id,
             "model": args.model,
             "profile": args.profile,
+            "scenario_variant": args.scenario_variant,
             "configured_rps": args.rps,
             "no_connection_reuse": args.no_connection_reuse,
             "component_group": group,
@@ -131,16 +143,6 @@ def main():
             "memory_mean_mib": round(statistics.fmean(memory), 6),
             "memory_max_mib": round(max(memory), 6),
         })
-
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", newline="", encoding="utf-8") as handle:
-        if rows:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        else:
-            handle.write("run_id,model,profile,configured_rps,no_connection_reuse,component_group,samples,cpu_mean_mcores,cpu_max_mcores,memory_mean_mib,memory_max_mib\n")
 
     append_rows(Path(args.master), rows)
 

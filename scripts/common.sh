@@ -495,12 +495,59 @@ apply_ambient_l7_policy() {
   apply_policy_file "${ROOT_DIR}/k8s/policies/istio-ambient-l7.yaml"
 }
 
+apply_l7_spaghetti_policy() {
+  local model
+  model="$(canonical_model "$1")"
+
+  case "${model}" in
+    calico-l7)
+      apply_policy_file "${ROOT_DIR}/k8s/policies/calico-l7-spaghetti.yaml"
+      ;;
+    ambient-l7)
+      apply_policy_file "${ROOT_DIR}/k8s/policies/istio-ambient-l7-spaghetti.yaml"
+      ;;
+    *)
+      die "L7 spaghetti policy is supported only for calico-l7 and ambient-l7"
+      ;;
+  esac
+}
+
+restore_simple_l7_policy() {
+  local model
+  model="$(canonical_model "$1")"
+
+  case "${model}" in
+    calico-l7)
+      apply_calico_l7_policy
+      ;;
+    ambient-l7)
+      kubectl delete authorizationpolicy server-l7-spaghetti-deny \
+        -n "${APP_NS}" --ignore-not-found >/dev/null
+      apply_ambient_l7_policy
+      ;;
+    *)
+      die "Simple L7 policy restore is supported only for calico-l7 and ambient-l7"
+      ;;
+  esac
+}
+
 create_waypoint_for_server() {
   install_gateway_api_crds
-  msg "Creating service waypoint for server"
-  istioctl waypoint apply -n "${APP_NS}" --name server-waypoint --for service --wait
-  kubectl label service server -n "${APP_NS}" istio.io/use-waypoint=server-waypoint --overwrite
-  kubectl wait --for=condition=Programmed gateway/server-waypoint -n "${APP_NS}" --timeout=300s || true
+  msg "Creating and enrolling the server waypoint"
+  istioctl waypoint apply -n "${APP_NS}" \
+    --name server-waypoint \
+    --for service \
+    --enroll-namespace \
+    --wait
+
+  kubectl wait --for=condition=Programmed gateway/server-waypoint \
+    -n "${APP_NS}" --timeout=300s
+
+  local enrolled_waypoint=""
+  enrolled_waypoint="$(kubectl get namespace "${APP_NS}" \
+    -o jsonpath='{.metadata.labels.istio\.io/use-waypoint}')"
+  [[ "${enrolled_waypoint}" == "server-waypoint" ]] \
+    || die "Namespace ${APP_NS} is not enrolled in server-waypoint"
 }
 
 wait_app_ready() {
@@ -536,6 +583,69 @@ ambient_preflight() {
   service_preflight
   msg "Ambient components"
   kubectl get pods -n istio-system -o wide
+}
+
+http_status_from_client() {
+  local method="$1"
+  local url="$2"
+  local output=""
+
+  if [[ "${method}" == "POST" ]]; then
+    output="$(kubectl exec -n "${APP_NS}" deployment/client -c client -- \
+      wget -S -O - --post-data=probe "${url}" 2>&1 >/dev/null || true)"
+  else
+    output="$(kubectl exec -n "${APP_NS}" deployment/client -c client -- \
+      wget -S -O - "${url}" 2>&1 >/dev/null || true)"
+  fi
+
+  awk '{
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /^HTTP\/[0-9.]+$/ && (i + 1) <= NF && $(i + 1) ~ /^[0-9][0-9][0-9]$/) {
+        status = $(i + 1)
+      }
+    }
+  } END { print status }' <<<"${output}"
+}
+
+ambient_l7_preflight() {
+  ambient_preflight
+  msg "Checking Ambient L7 policy through the waypoint"
+
+  local timeout="${AMBIENT_L7_PREFLIGHT_TIMEOUT:-90}"
+  local interval="${AMBIENT_L7_PREFLIGHT_INTERVAL:-2}"
+  local end_ts=$((SECONDS + timeout))
+  local attempt=0
+  local get_status=""
+  local post_status=""
+
+  while (( SECONDS < end_ts )); do
+    attempt=$((attempt + 1))
+    get_status="$(http_status_from_client GET http://server:8080/api/data)"
+    post_status="$(http_status_from_client POST http://server:8080/api/data)"
+
+    if [[ "${get_status}" == "200" && "${post_status}" == "403" ]]; then
+      msg "Ambient L7 policy is ready through the waypoint (attempt ${attempt})"
+      return 0
+    fi
+
+    warn "Ambient L7 waypoint not ready yet (attempt ${attempt}): GET=${get_status:-no-status}, POST=${post_status:-no-status}; retrying in ${interval}s"
+    sleep "${interval}"
+  done
+
+  warn "Ambient L7 preflight timed out after ${timeout}s"
+  kubectl get gateway/server-waypoint -n "${APP_NS}" -o wide || true
+  kubectl get pods -n "${APP_NS}" -o wide || true
+  kubectl get pods -n istio-system -o wide || true
+  kubectl get authorizationpolicy.security.istio.io -n "${APP_NS}" || true
+
+  warn "Raw Ambient L7 GET probe output:"
+  kubectl exec -n "${APP_NS}" deployment/client -c client -- \
+    wget -S -O - http://server:8080/api/data 2>&1 >/dev/null || true
+  warn "Raw Ambient L7 POST probe output:"
+  kubectl exec -n "${APP_NS}" deployment/client -c client -- \
+    wget -S -O - --post-data=probe http://server:8080/api/data 2>&1 >/dev/null || true
+
+  die "Ambient L7 preflight failed after ${timeout}s: GET /api/data returned ${get_status:-no HTTP status} (expected 200), POST /api/data returned ${post_status:-no HTTP status} (expected 403)"
 }
 
 dikastes_preflight() {
@@ -667,5 +777,11 @@ render_k6_job() {
     -e "s|__SERVER_DELAY_MS__|${SERVER_DELAY_MS}|g" \
     -e "s|__TIMEOUT__|${TIMEOUT}|g" \
     -e "s|__SLEEP_MS__|${SLEEP_MS}|g" \
+    -e "s|__ALLOWED_RPS__|${ALLOWED_RPS}|g" \
+    -e "s|__BLOCKED_RPS__|${BLOCKED_RPS}|g" \
+    -e "s|__BLOCKED_TARGET_URL__|${BLOCKED_TARGET_URL}|g" \
+    -e "s|__BLOCKED_METHOD__|${BLOCKED_METHOD}|g" \
+    -e "s|__BLOCKED_PATH__|${BLOCKED_PATH}|g" \
+    -e "s|__SCENARIO_VARIANT__|${SCENARIO_VARIANT}|g" \
     "${ROOT_DIR}/k8s/k6-job.yaml.tmpl" > "${output}"
 }

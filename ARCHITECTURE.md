@@ -78,3 +78,27 @@ k6 -> source ztunnel -> HBONE -> destination ztunnel + L4 AuthorizationPolicy ->
 ```text
 k6 -> source ztunnel -> HBONE -> service waypoint + L7 AuthorizationPolicy -> destination ztunnel + L4 AuthorizationPolicy -> server
 ```
+
+## Complex policy scenarios
+
+### L4 attack
+
+The L4 models receive two concurrent open-model streams from k6. Both streams create new connections:
+
+```text
+allowed stream -> server:8080 -> accepted
+blocked stream -> server:8081 -> denied by L4 policy
+```
+
+The total RPS and blocked percentage are recorded in the summary CSV. Separate custom metrics prevent expected L4 failures from being mixed with latency for accepted requests.
+
+### L7 spaghetti policy
+
+The L7 models are measured twice with an identical traffic mix:
+
+```text
+simple policy     -> allowed GET + blocked POST
+spaghetti policy -> allowed GET + blocked POST
+```
+
+The Calico variant contains many HTTP allow clauses and relies on implicit deny for unmatched traffic. The Ambient variant combines many DENY and ALLOW rules at the service waypoint. The runner restores the simple policy after the comparison.

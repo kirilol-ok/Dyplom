@@ -1,6 +1,26 @@
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
+  name: server-require-waypoint
+  namespace: __APP_NS__
+spec:
+  selector:
+    matchLabels:
+      app: server
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/__APP_NS__/sa/server-waypoint
+      to:
+        - operation:
+            ports:
+              - "8080"
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
   name: server-l7-allow-get
   namespace: __APP_NS__
 spec:

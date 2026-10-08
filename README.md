@@ -55,17 +55,17 @@ The intent is to compare the cost of adding policy enforcement step by step, rat
 
 Dikastes is deliberately not used in the Ambient L7 model.
 
-## Main benchmark scenarios
+## Benchmark scenarios
 
-The main benchmark suite contains only the scenarios currently required by the experiment design:
+The benchmark suite contains:
 
 1. `steady` - fixed arrival-rate load at several RPS levels.
 2. `churn` - connection reuse versus disabled connection reuse.
-3. `verify` - lightweight policy correctness checks. This is environment verification, not a performance result.
+3. `l4-attack` - simultaneous new connections to the allowed port 8080 and the blocked port 8081. Keep-alive and per-VU connection reuse are disabled.
+4. `l7-spaghetti` - the same allowed GET and blocked POST traffic is measured against a simple L7 policy and a deliberately complex policy.
+5. `verify` - lightweight policy correctness checks. This is environment verification, not a performance result.
 
-Saturation-search and VU-sweep scenarios are intentionally not part of this version.
-
-The future complex L4 attack scenario and future L7 spaghetti-policy scenario are intentionally not included yet.
+The optional `concurrency` and `saturation` suites remain available for exploratory runs, but they are not started by `run-full-matrix.sh`.
 
 ## Default steady-load matrix
 
@@ -189,9 +189,57 @@ bash scripts/run-benchmark-suite.sh calico-l4 churn
 
 By default the suite runs both normal connection reuse and `noConnectionReuse=true` so the connection-churn effect can be measured against its own control.
 
+## Run the complex L4 attack scenario
+
+Run it on the two L4 models:
+
+```bash
+L4_ATTACK_RATES="200 400 600" \
+L4_ATTACK_BLOCKED_PERCENT=50 \
+REPEATS=3 \
+bash scripts/run-benchmark-suite.sh calico-l4 l4-attack
+
+L4_ATTACK_RATES="200 400 600" \
+L4_ATTACK_BLOCKED_PERCENT=50 \
+REPEATS=3 \
+bash scripts/run-benchmark-suite.sh ambient-l4 l4-attack
+```
+
+At every total RPS level, the script splits traffic between:
+
+- allowed `GET http://server:8080/api/data`;
+- blocked `GET http://server:8081/health`.
+
+Both streams use new connections. The blocked share can be changed from 1 to 99 percent. A short timeout is intentional because a dropped L4 connection has no HTTP response.
+
+## Run the complex L7 spaghetti-policy scenario
+
+Run it on the two L7 models:
+
+```bash
+L7_SPAGHETTI_RPS=300 \
+L7_SPAGHETTI_BLOCKED_PERCENT=50 \
+L7_SPAGHETTI_VARIANTS="simple spaghetti" \
+REPEATS=3 \
+bash scripts/run-benchmark-suite.sh calico-l7 l7-spaghetti
+
+L7_SPAGHETTI_RPS=300 \
+L7_SPAGHETTI_BLOCKED_PERCENT=50 \
+L7_SPAGHETTI_VARIANTS="simple spaghetti" \
+REPEATS=3 \
+bash scripts/run-benchmark-suite.sh ambient-l7 l7-spaghetti
+```
+
+The traffic mix stays constant between the two policy variants:
+
+- allowed `GET /api/data`;
+- blocked `POST /api/data`.
+
+The `simple` variant is the control. The `spaghetti` variant has many overlapping and irrelevant method/path rules, with the tested decision embedded among them. Calico Open Source supports L7 match criteria only on `Allow` rules, so its blocked request falls through to implicit deny. Istio uses both explicit `DENY` and `ALLOW` policies. The original simple policy is restored automatically after the test and also on script exit.
+
 ## Run the complete current matrix sequentially
 
-This helper creates one clean model, verifies it, runs steady load and churn, then deletes the cluster before moving to the next model:
+This helper creates one clean model, verifies it, runs steady load and churn, runs the complex test appropriate to L4 or L7 models, then deletes the cluster before moving to the next model:
 
 ```bash
 bash scripts/run-full-matrix.sh
@@ -205,30 +253,24 @@ RATES="100 200 300 400 500" REPEATS=3 bash scripts/run-full-matrix.sh
 
 Set `CLEANUP_AFTER_MODEL=false` only when you explicitly want to keep the most recently created clusters.
 
+The complex suites can be disabled independently:
+
+```bash
+RUN_L4_ATTACK=false RUN_L7_SPAGHETTI=false bash scripts/run-full-matrix.sh
+```
+
 ## Results
 
-Per-run files are stored under:
-
-```text
-results/<model>/
-```
-
-Typical files:
-
-```text
-*.log
-*-summary.json
-*-raw.json
-*-resources.csv
-*-resource-summary.csv
-```
-
-Master CSV files:
+Only the two master CSV files are kept:
 
 ```text
 results/benchmark-summary.csv
 results/benchmark-resources.csv
 ```
+
+k6 logs are streamed to the terminal. Summary JSON and raw resource samples are temporary and are deleted after their values are appended to the master CSV files. No `results/<model>/` directories are created.
+
+If the archive already contains CSV files from an older schema, the first new run expands their headers atomically and keeps every existing row. Unknown columns still stop the write instead of being discarded.
 
 The steady-load summary stores at least:
 
@@ -246,6 +288,8 @@ max
 ```
 
 The p5 value was added specifically so the final latency plot can show a median line over a p5-p95 ribbon.
+
+Rows produced by `l4-attack` and `l7-spaghetti` also contain the scenario variant, configured allowed/blocked RPS, request counts, correctness rates, and separate median/p95 request and TCP connection timing for allowed and blocked traffic. Do not use aggregate latency alone for mixed allow/block scenarios.
 
 ## CPU and RAM collection
 

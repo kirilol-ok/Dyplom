@@ -6,22 +6,22 @@ export const expectedStatusRate = new Rate('expected_status_rate');
 export const appProcessingMs = new Trend('app_processing_ms', true);
 export const infrastructureOverheadMs = new Trend('infrastructure_overhead_ms', true);
 
-function env(name, fallback) {
+export function env(name, fallback) {
   const value = __ENV[name];
   return value === undefined || value === '' ? fallback : value;
 }
 
-function toInt(value, fallback) {
+export function toInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function toFloat(value, fallback) {
+export function toFloat(value, fallback) {
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function toBool(value, fallback = false) {
+export function toBool(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
   return String(value).toLowerCase() === 'true';
 }
@@ -42,6 +42,12 @@ export const cfg = {
   serverDelayMs: toInt(env('SERVER_DELAY_MS', '0'), 0),
   timeout: env('TIMEOUT', '5s'),
   sleepMs: toInt(env('SLEEP_MS', '0'), 0),
+  allowedRps: toInt(env('ALLOWED_RPS', '0'), 0),
+  blockedRps: toInt(env('BLOCKED_RPS', '0'), 0),
+  blockedTargetUrl: env('BLOCKED_TARGET_URL', 'http://server:8081'),
+  blockedMethod: env('BLOCKED_METHOD', 'GET').toUpperCase(),
+  blockedPath: env('BLOCKED_PATH', '/health'),
+  scenarioVariant: env('SCENARIO_VARIANT', 'default'),
 };
 
 function makePayload(size) {
@@ -62,7 +68,7 @@ function requestUrl(targetUrl, requestPath) {
   return `${base}${separator}response_size=${cfg.responseSize}&server_delay_ms=${cfg.serverDelayMs}`;
 }
 
-function expectedResponse(res, mode) {
+export function expectedResponse(res, mode) {
   switch (mode) {
     case 'allowed':
     case 'baseline-open':
@@ -146,6 +152,12 @@ export function makeSummary(data, profile) {
     testMode: cfg.testMode,
     noConnectionReuse: cfg.noConnectionReuse,
     serverDelayMs: cfg.serverDelayMs,
+    allowedRps: cfg.allowedRps,
+    blockedRps: cfg.blockedRps,
+    blockedTargetUrl: cfg.blockedTargetUrl,
+    blockedMethod: cfg.blockedMethod,
+    blockedPath: cfg.blockedPath,
+    scenarioVariant: cfg.scenarioVariant,
   };
 
   const duration = data.metrics?.http_req_duration?.values || {};
@@ -161,8 +173,10 @@ export function makeSummary(data, profile) {
     `profile: ${profile}`,
     `model: ${cfg.model}`,
     `mode: ${cfg.testMode}`,
+    `variant: ${cfg.scenarioVariant}`,
     `target: ${cfg.targetUrl}${cfg.requestPath}`,
     `configured rps: ${cfg.rps}`,
+    `allowed/blocked rps: ${cfg.allowedRps}/${cfg.blockedRps}`,
     `duration: ${cfg.duration}`,
     `connection reuse disabled: ${cfg.noConnectionReuse}`,
     `requests: ${reqs}`,

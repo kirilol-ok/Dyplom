@@ -1,0 +1,184 @@
+apiVersion: projectcalico.org/v3
+kind: NetworkPolicy
+metadata:
+  name: server-l7-http-allow
+  namespace: __APP_NS__
+  annotations:
+    benchmark.diploma/policy-variant: spaghetti
+spec:
+  selector: app == 'server'
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [15020, 15021, 15090]
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - exact: /health
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [POST]
+        paths:
+          - exact: /api/import
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [PUT]
+        paths:
+          - exact: /api/settings
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [PATCH]
+        paths:
+          - prefix: /api/profile/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [DELETE]
+        paths:
+          - exact: /api/cache
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - prefix: /assets/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - prefix: /reports/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [POST]
+        paths:
+          - exact: /reports/export
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - exact: /api/v9/archive
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [HEAD]
+        paths:
+          - prefix: /api/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [OPTIONS]
+        paths:
+          - prefix: /api/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [POST]
+        paths:
+          - prefix: /public/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - exact: /status/ready
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - exact: /status/live
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [PUT]
+        paths:
+          - prefix: /jobs/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [POST]
+        paths:
+          - prefix: /events/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - exact: /internal/version
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [PATCH]
+        paths:
+          - exact: /internal/flags
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - prefix: /downloads/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [POST]
+        paths:
+          - prefix: /uploads/
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [8080]
+      http:
+        methods: [GET]
+        paths:
+          - prefix: /api/

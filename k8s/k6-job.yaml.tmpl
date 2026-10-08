@@ -31,7 +31,7 @@ spec:
             - |
               set -u
               set +e
-              k6 run --out json=/results/k6-raw.json "/scripts/__K6_SCRIPT__"
+              k6 run "/scripts/__K6_SCRIPT__"
               code=$?
               set -e
               touch /results/.k6-finished
@@ -73,6 +73,18 @@ spec:
               value: "__TIMEOUT__"
             - name: SLEEP_MS
               value: "__SLEEP_MS__"
+            - name: ALLOWED_RPS
+              value: "__ALLOWED_RPS__"
+            - name: BLOCKED_RPS
+              value: "__BLOCKED_RPS__"
+            - name: BLOCKED_TARGET_URL
+              value: "__BLOCKED_TARGET_URL__"
+            - name: BLOCKED_METHOD
+              value: "__BLOCKED_METHOD__"
+            - name: BLOCKED_PATH
+              value: "__BLOCKED_PATH__"
+            - name: SCENARIO_VARIANT
+              value: "__SCENARIO_VARIANT__"
           resources:
             requests:
               cpu: 100m

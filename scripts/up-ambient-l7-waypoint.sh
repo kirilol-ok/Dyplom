@@ -14,12 +14,11 @@ install_gateway_api_crds
 install_istio_ambient
 build_and_import_app_image "${CLUSTER_NAME}"
 reset_app_namespace
+create_waypoint_for_server
 label_namespace "${APP_NS}" istio.io/dataplane-mode=ambient
 apply_app normal
 wait_app_ready
-create_waypoint_for_server
-apply_ambient_l4_policy
 apply_ambient_l7_policy
 create_k6_configmap
-ambient_preflight
+ambient_l7_preflight
 print_ready_message "${MODEL}" "${CLUSTER_NAME}"

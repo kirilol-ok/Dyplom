@@ -40,12 +40,22 @@ def append_row(path, row):
     exists = path.exists() and path.stat().st_size > 0
     if exists:
         with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.reader(handle)
-            existing = next(reader, [])
+            reader = csv.DictReader(handle)
+            existing = reader.fieldnames or []
+            existing_rows = list(reader)
         if existing != fieldnames:
-            raise SystemExit(
-                f"CSV schema mismatch in {path}. Move the old file away before mixing v1 and v2 results."
-            )
+            unknown = [name for name in existing if name not in fieldnames]
+            if unknown:
+                raise SystemExit(
+                    f"CSV schema mismatch in {path}. Unknown existing columns: {', '.join(unknown)}"
+                )
+
+            temporary = path.with_name(f".{path.name}.schema-upgrade.tmp")
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(existing_rows)
+            temporary.replace(path)
 
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -75,7 +85,10 @@ def main():
         "level": level,
         "profile": diploma.get("profile", ""),
         "test_mode": diploma.get("testMode", ""),
+        "scenario_variant": diploma.get("scenarioVariant", ""),
         "configured_rps": diploma.get("rps", ""),
+        "allowed_rps": diploma.get("allowedRps", ""),
+        "blocked_rps": diploma.get("blockedRps", ""),
         "achieved_rps": metric(data, "http_reqs", "rate"),
         "configured_vus": diploma.get("vus", ""),
         "configured_duration": diploma.get("duration", ""),
@@ -95,9 +108,36 @@ def main():
         "app_p95_ms": metric(data, "app_processing_ms", "p(95)"),
         "infrastructure_avg_ms": metric(data, "infrastructure_overhead_ms", "avg"),
         "infrastructure_p95_ms": metric(data, "infrastructure_overhead_ms", "p(95)"),
+        "policy_allowed_reqs": metric(data, "policy_allowed_requests", "count"),
+        "policy_blocked_reqs": metric(data, "policy_blocked_requests", "count"),
+        "policy_allowed_expected_pct": percent(
+            metric(data, "policy_allowed_expected_rate", "rate")
+        ),
+        "policy_blocked_expected_pct": percent(
+            metric(data, "policy_blocked_expected_rate", "rate")
+        ),
+        "policy_allowed_p50_ms": metric(data, "policy_allowed_duration_ms", "med"),
+        "policy_allowed_p95_ms": metric(data, "policy_allowed_duration_ms", "p(95)"),
+        "policy_blocked_p50_ms": metric(data, "policy_blocked_duration_ms", "med"),
+        "policy_blocked_p95_ms": metric(data, "policy_blocked_duration_ms", "p(95)"),
+        "policy_allowed_connect_p50_ms": metric(
+            data, "policy_allowed_connecting_ms", "med"
+        ),
+        "policy_allowed_connect_p95_ms": metric(
+            data, "policy_allowed_connecting_ms", "p(95)"
+        ),
+        "policy_blocked_connect_p50_ms": metric(
+            data, "policy_blocked_connecting_ms", "med"
+        ),
+        "policy_blocked_connect_p95_ms": metric(
+            data, "policy_blocked_connecting_ms", "p(95)"
+        ),
         "target_url": diploma.get("targetUrl", ""),
         "request_method": diploma.get("requestMethod", ""),
         "request_path": diploma.get("requestPath", ""),
+        "blocked_target_url": diploma.get("blockedTargetUrl", ""),
+        "blocked_method": diploma.get("blockedMethod", ""),
+        "blocked_path": diploma.get("blockedPath", ""),
         "payload_size": diploma.get("payloadSize", ""),
         "response_size": diploma.get("responseSize", ""),
         "server_delay_ms": diploma.get("serverDelayMs", ""),
