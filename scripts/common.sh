@@ -746,9 +746,9 @@ copy_pod_file() {
   local pod="$2"
   local remote="$3"
   local local_file="$4"
-  if kubectl exec -n "${ns}" "${pod}" -c k6 -- sh -c "test -f '${remote}'" >/dev/null 2>&1; then
+  if kubectl exec -n "${ns}" "${pod}" -c k6 -- sh -c "test -s '${remote}'" >/dev/null 2>&1; then
     kubectl exec -n "${ns}" "${pod}" -c k6 -- sh -c "cat '${remote}'" > "${local_file}"
-    return 0
+    return $?
   fi
   return 1
 }

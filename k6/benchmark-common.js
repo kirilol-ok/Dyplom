@@ -164,6 +164,9 @@ export function makeSummary(data, profile) {
   const reqRate = metricValue(data, 'http_reqs', 'rate');
   const reqs = metricValue(data, 'http_reqs', 'count');
   const dropped = metricValue(data, 'dropped_iterations', 'count');
+  const iterations = metricValue(data, 'iterations', 'count');
+  const scheduled = iterations + dropped;
+  const dropRate = scheduled > 0 ? (100 * dropped / scheduled).toFixed(2) : '0.00';
   const expected = metricValue(data, 'expected_status_rate', 'rate', 1);
   const failed = metricValue(data, 'http_req_failed', 'rate');
 
@@ -188,11 +191,21 @@ export function makeSummary(data, profile) {
     `http fail rate: ${percentage(failed)}`,
     `expected status rate: ${percentage(expected)}`,
     `dropped iterations: ${dropped}`,
+    `drop rate: ${dropRate}%`,
     '',
   ].join('\n');
 
+  // Back up the complete structured summary in Kubernetes pod logs.
+  // Small chunks avoid the container runtime's per-line log size limits.
+  const json = JSON.stringify(data);
+  const logChunks = ['__DIPLOMA_K6_JSON_BEGIN__'];
+  for (let offset = 0; offset < json.length; offset += 3000) {
+    logChunks.push(`__DIPLOMA_K6_JSON_CHUNK__${json.slice(offset, offset + 3000)}`);
+  }
+  logChunks.push('__DIPLOMA_K6_JSON_END__');
+
   return {
-    stdout: text,
+    stdout: text + logChunks.join('\n') + '\n',
     '/results/summary.json': JSON.stringify(data, null, 2),
   };
 }

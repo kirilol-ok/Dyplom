@@ -17,7 +17,7 @@ cluster_exists "${CLUSTER_NAME}" || die "Cluster does not exist: ${CLUSTER_NAME}
 
 TARGET_MODE="${TARGET_MODE:-direct}"
 TARGET_URL="${TARGET_URL:-http://server:8080}"
-VUS="${VUS:-300}"
+VUS="${VUS:-100}"
 DURATION="${DURATION:-45s}"
 RPS="${RPS:-0}"
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-128}"
@@ -46,6 +46,7 @@ RUN_ID="${RUN_ID//\//_}"
 RUN_TMP_DIR="$(mktemp -d "${TMP_DIR}/${RUN_ID}.XXXXXX")"
 SUMMARY_FILE="${RUN_TMP_DIR}/summary.json"
 RESOURCE_FILE="${RUN_TMP_DIR}/resources.csv"
+METADATA_FILE="${RUN_TMP_DIR}/metadata.json"
 JOB_NAME="k6-${STAMP,,}-$RANDOM"
 JOB_NAME="${JOB_NAME:0:62}"
 RENDERED_JOB="${RUN_TMP_DIR}/${JOB_NAME}.yaml"
@@ -112,6 +113,20 @@ if ! wait_pod_running_or_done "${APP_NS}" "${POD_NAME}"; then
   die "k6 pod failed to start"
 fi
 
+# Wait until the k6 process is held at the explicit start gate.
+if ! wait_for_pod_file "${APP_NS}" "${POD_NAME}" /results/.k6-ready 120; then
+  die "k6 pod did not reach the benchmark start gate"
+fi
+
+python3 "${ROOT_DIR}/scripts/benchmark-metadata.py" \
+  --output "${METADATA_FILE}" \
+  --archive-dir "${RESULTS_DIR}/benchmark-configs" \
+  --repo-root "${ROOT_DIR}" \
+  --namespace "${APP_NS}" \
+  --script "${K6_SCRIPT_PATH}" \
+  --job-name "${JOB_NAME}" --k6-pod "${POD_NAME}"
+CONFIG_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8"))["config_id"])' "${METADATA_FILE}")"
+
 if [[ "${RESOURCE_CSV_ENABLED}" == "true" ]]; then
   msg "Starting CPU/RAM collector"
   python3 "${ROOT_DIR}/scripts/collect-resources.py" \
@@ -120,16 +135,65 @@ if [[ "${RESOURCE_CSV_ENABLED}" == "true" ]]; then
   RESOURCE_PID=$!
 fi
 
+# Keep the structured summary out of the interactive console output.
+# The full JSON remains available in Kubernetes pod logs as a recovery channel.
 msg "Streaming k6 logs"
-kubectl logs -n "${APP_NS}" -f "${POD_NAME}" -c k6 --pod-running-timeout=180s &
+(
+  kubectl logs -n "${APP_NS}" -f "${POD_NAME}" -c k6 --pod-running-timeout=180s 2>&1 |
+  while IFS= read -r line; do
+    case "${line}" in
+      __DIPLOMA_K6_JSON_*) ;;
+      *) printf '%s\n' "${line}" ;;
+    esac
+  done
+) &
 LOGS_PID=$!
 
-if wait_for_pod_file "${APP_NS}" "${POD_NAME}" /results/.k6-finished 1200; then
-  copy_pod_file "${APP_NS}" "${POD_NAME}" /results/summary.json "${SUMMARY_FILE}" || true
-  kubectl exec -n "${APP_NS}" "${POD_NAME}" -c k6 -- sh -c "touch /results/.copied" || true
-else
-  warn "Timed out waiting for k6 result marker"
-  kubectl exec -n "${APP_NS}" "${POD_NAME}" -c k6 -- sh -c "touch /results/.copied" || true
+# Start k6 after metadata and the CPU/RAM collector are ready.
+kubectl exec -n "${APP_NS}" "${POD_NAME}" -c k6 -- \
+  sh -c "touch /results/.start"
+
+if ! wait_for_pod_file "${APP_NS}" "${POD_NAME}" /results/.k6-finished 1200; then
+  warn "Timed out waiting for the k6 completion marker; attempting log recovery"
+fi
+
+# First try to copy the file directly. On some Docker Desktop / k3d setups,
+# kubectl exec can fail near container completion, leaving valid k6 results in
+# pod logs but no local JSON. Never acknowledge collection before recovery.
+SUMMARY_OK=false
+for attempt in 1 2 3 4 5; do
+  candidate="${SUMMARY_FILE}.partial"
+  rm -f "${candidate}"
+  if copy_pod_file "${APP_NS}" "${POD_NAME}" /results/summary.json "${candidate}" &&
+     python3 "${ROOT_DIR}/scripts/recover-k6-summary.py" --validate "${candidate}" >/dev/null 2>&1; then
+    mv -f "${candidate}" "${SUMMARY_FILE}"
+    SUMMARY_OK=true
+    break
+  fi
+  sleep 1
+done
+rm -f "${SUMMARY_FILE}.partial"
+
+# k6 handleSummary emits a second JSON representation into its log stream.
+# This works even if the container already terminated or file transfer failed.
+if [[ "${SUMMARY_OK}" != "true" ]]; then
+  warn "Direct JSON collection failed; recovering summary from k6 logs"
+  for attempt in 1 2 3; do
+    if kubectl logs -n "${APP_NS}" "${POD_NAME}" -c k6 > "${RUN_TMP_DIR}/k6.log" 2>"${RUN_TMP_DIR}/kubectl-logs.err" &&
+       python3 "${ROOT_DIR}/scripts/recover-k6-summary.py" \
+         --logs "${RUN_TMP_DIR}/k6.log" --output "${SUMMARY_FILE}"; then
+      SUMMARY_OK=true
+      msg "Recovered summary JSON from k6 logs"
+      break
+    fi
+    sleep 2
+  done
+fi
+
+# Let the job terminate after successful retrieval or a recorded failure.
+if ! kubectl exec -n "${APP_NS}" "${POD_NAME}" -c k6 -- \
+    sh -c "touch /results/.copied" >/dev/null 2>&1; then
+  warn "Could not signal k6 job completion (pod may already be terminated)"
 fi
 
 if [[ -n "${RESOURCE_PID}" ]]; then
@@ -138,22 +202,33 @@ if [[ -n "${RESOURCE_PID}" ]]; then
   RESOURCE_PID=""
 fi
 
-kubectl wait --for=condition=complete "job/${JOB_NAME}" -n "${APP_NS}" --timeout=120s >/dev/null 2>&1 \
-  || kubectl wait --for=condition=failed "job/${JOB_NAME}" -n "${APP_NS}" --timeout=60s >/dev/null 2>&1 \
+# Avoid waiting for the full pod hold timeout if the completion signal failed.
+kubectl wait --for=condition=complete "job/${JOB_NAME}" -n "${APP_NS}" --timeout=30s >/dev/null 2>&1 \
+  || kubectl wait --for=condition=failed "job/${JOB_NAME}" -n "${APP_NS}" --timeout=10s >/dev/null 2>&1 \
   || true
-wait "${LOGS_PID}" 2>/dev/null || true
+# The log follower may remain attached if Kubernetes cannot terminate the pod.
+# Do not let it block the next run for the container's 600-second hold timeout.
+if [[ -n "${LOGS_PID}" ]]; then
+  kill "${LOGS_PID}" >/dev/null 2>&1 || true
+  wait "${LOGS_PID}" 2>/dev/null || true
+fi
 LOGS_PID=""
 
-if [[ ! -f "${SUMMARY_FILE}" ]]; then
-  kubectl get job "${JOB_NAME}" -n "${APP_NS}" || true
-  kubectl describe pod "${POD_NAME}" -n "${APP_NS}" || true
-  die "Summary file was not collected"
+if [[ "${SUMMARY_OK}" != "true" || ! -s "${SUMMARY_FILE}" ]]; then
+  FAIL_DIR="${RESULTS_DIR}/failed-runs/${RUN_ID}"
+  mkdir -p "${FAIL_DIR}"
+  cp -f "${METADATA_FILE}" "${FAIL_DIR}/metadata.json" 2>/dev/null || true
+  kubectl logs -n "${APP_NS}" "${POD_NAME}" -c k6 > "${FAIL_DIR}/k6.log" 2>&1 || true
+  kubectl describe pod "${POD_NAME}" -n "${APP_NS}" > "${FAIL_DIR}/pod-description.txt" 2>&1 || true
+  warn "Failed run diagnostics saved: ${FAIL_DIR}"
+  die "Summary file was not collected. See diagnostics in ${FAIL_DIR}"
 fi
 
 python3 "${ROOT_DIR}/scripts/summary-to-csv.py" \
   "${SUMMARY_FILE}" \
   "${RESULTS_DIR}/benchmark-summary.csv" \
-  --run-id "${RUN_ID}"
+  --run-id "${RUN_ID}" \
+  --metadata "${METADATA_FILE}"
 
 if [[ "${RESOURCE_CSV_ENABLED}" == "true" && -f "${RESOURCE_FILE}" ]]; then
   python3 "${ROOT_DIR}/scripts/summarize-resources.py" \
@@ -164,7 +239,8 @@ if [[ "${RESOURCE_CSV_ENABLED}" == "true" && -f "${RESOURCE_FILE}" ]]; then
     --profile "${PROFILE}" \
     --scenario-variant "${SCENARIO_VARIANT}" \
     --rps "${RPS}" \
-    --no-connection-reuse "${NO_CONNECTION_REUSE}"
+    --no-connection-reuse "${NO_CONNECTION_REUSE}" \
+    --config-id "${CONFIG_ID}"
 fi
 
 echo
@@ -172,6 +248,7 @@ python3 "${ROOT_DIR}/scripts/pretty-summary.py" "${SUMMARY_FILE}"
 echo
 msg "Saved CSV rows to:"
 echo "  ${RESULTS_DIR}/benchmark-summary.csv"
+echo "  ${RESULTS_DIR}/benchmark-configs/${CONFIG_ID}.json"
 if [[ "${RESOURCE_CSV_ENABLED}" == "true" ]]; then
   echo "  ${RESULTS_DIR}/benchmark-resources.csv"
 fi

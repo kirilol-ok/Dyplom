@@ -69,6 +69,7 @@ def main():
     parser.add_argument("summary")
     parser.add_argument("csv")
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--metadata", help="Run resource metadata JSON")
     args = parser.parse_args()
 
     with open(args.summary, encoding="utf-8") as handle:
@@ -77,6 +78,15 @@ def main():
     diploma = data.get("diploma", {})
     model = str(diploma.get("model", "unknown"))
     family, level = family_level(model)
+    metadata = {}
+    if args.metadata:
+        with open(args.metadata, encoding="utf-8") as handle:
+            metadata = json.load(handle)
+
+    iterations = metric(data, "iterations", "count", 0)
+    dropped = metric(data, "dropped_iterations", "count", 0)
+    scheduled = float(iterations or 0) + float(dropped or 0)
+    drop_rate_pct = round(100.0 * float(dropped or 0) / scheduled, 6) if scheduled else 0.0
 
     row = {
         "run_id": args.run_id,
@@ -94,7 +104,9 @@ def main():
         "configured_duration": diploma.get("duration", ""),
         "no_connection_reuse": diploma.get("noConnectionReuse", ""),
         "http_reqs": metric(data, "http_reqs", "count"),
-        "dropped_iterations": metric(data, "dropped_iterations", "count", 0),
+        "iterations": iterations,
+        "dropped_iterations": dropped,
+        "drop_rate_pct": drop_rate_pct,
         "expected_status_pct": percent(metric(data, "expected_status_rate", "rate", 1)),
         "http_failed_pct": percent(metric(data, "http_req_failed", "rate", 0)),
         "http_avg_ms": metric(data, "http_req_duration", "avg"),
@@ -141,6 +153,15 @@ def main():
         "payload_size": diploma.get("payloadSize", ""),
         "response_size": diploma.get("responseSize", ""),
         "server_delay_ms": diploma.get("serverDelayMs", ""),
+        "config_id": metadata.get("config_id", ""),
+        "git_revision": metadata.get("git_revision", ""),
+        "server_cpu_request": metadata.get("server_cpu_request", ""),
+        "server_cpu_limit": metadata.get("server_cpu_limit", ""),
+        "server_memory_limit": metadata.get("server_memory_limit", ""),
+        "k6_cpu_limit": metadata.get("k6_cpu_limit", ""),
+        "server_node": metadata.get("server_node", ""),
+        "client_node": metadata.get("client_node", ""),
+        "k6_node": metadata.get("k6_node", ""),
     }
 
     append_row(Path(args.csv), row)

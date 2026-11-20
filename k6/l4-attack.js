@@ -14,8 +14,8 @@ const totalRate = allowedRate + blockedRate;
 const totalVUs = Math.max(cfg.vus, 2);
 const allowedVUs = Math.max(1, Math.round(totalVUs * allowedRate / totalRate));
 const blockedVUs = Math.max(1, totalVUs - allowedVUs);
-const allowedMaxVUs = Math.max(allowedVUs * 5, allowedRate * 3);
-const blockedMaxVUs = Math.max(blockedVUs * 5, blockedRate * 3);
+const allowedMaxVUs = allowedVUs;
+const blockedMaxVUs = blockedVUs;
 
 export const options = {
   scenarios: {

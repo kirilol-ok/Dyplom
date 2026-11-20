@@ -31,6 +31,17 @@ spec:
             - |
               set -u
               set +e
+              # The runner releases the job only after resource and cgroup snapshots.
+              touch /results/.k6-ready
+              i=0
+              while [ ! -f /results/.start ] && [ "$i" -lt 300 ]; do
+                i=$((i + 1))
+                sleep 1
+              done
+              if [ ! -f /results/.start ]; then
+                echo "Benchmark start signal timed out" >&2
+                exit 1
+              fi
               k6 run "/scripts/__K6_SCRIPT__"
               code=$?
               set -e
@@ -90,7 +101,6 @@ spec:
               cpu: 100m
               memory: 128Mi
             limits:
-              cpu: "4"
               memory: 2Gi
           volumeMounts:
             - name: k6-scripts

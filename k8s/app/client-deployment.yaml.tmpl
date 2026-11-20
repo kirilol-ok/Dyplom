@@ -16,13 +16,11 @@ spec:
       serviceAccountName: client
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app: server
-                topologyKey: kubernetes.io/hostname
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: server
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: client
           image: __APP_IMAGE__
@@ -40,7 +38,6 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
-              cpu: 500m
               memory: 256Mi
           readinessProbe:
             exec:

@@ -15,6 +15,7 @@ export const options = {
       timeUnit: '1s',
       duration: cfg.duration,
       preAllocatedVUs: cfg.vus,
+      maxVUs: cfg.vus,
       gracefulStop: '10s',
     },
   },

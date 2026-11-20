@@ -17,6 +17,13 @@ spec:
         inject.istio.io/templates: sidecar,dikastes
     spec:
       serviceAccountName: server
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: client
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: server
           image: __APP_IMAGE__
@@ -34,7 +41,6 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
-              cpu: 500m
               memory: 256Mi
           readinessProbe:
             exec:

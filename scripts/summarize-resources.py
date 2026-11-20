@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--scenario-variant", default="default")
     parser.add_argument("--rps", required=True)
     parser.add_argument("--no-connection-reuse", required=True)
+    parser.add_argument("--config-id", default="")
     args = parser.parse_args()
 
     per_timestamp = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
@@ -142,6 +143,7 @@ def main():
             "cpu_max_mcores": round(max(cpu), 6),
             "memory_mean_mib": round(statistics.fmean(memory), 6),
             "memory_max_mib": round(max(memory), 6),
+            "config_id": args.config_id,
         })
 
     append_rows(Path(args.master), rows)

@@ -1,7 +1,7 @@
 import { cfg, executeRequest, makeSummary, performanceThresholds } from './benchmark-common.js';
 
 const targetRate = cfg.rps > 0 ? cfg.rps : 200;
-const maxVUs = Math.max(cfg.vus * 5, Math.ceil(targetRate * 2));
+const maxVUs = cfg.vus;
 
 export const options = {
   scenarios: {

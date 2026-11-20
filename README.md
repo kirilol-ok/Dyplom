@@ -65,17 +65,17 @@ The benchmark suite contains:
 4. `l7-spaghetti` - the same allowed GET and blocked POST traffic is measured against a simple L7 policy and a deliberately complex policy.
 5. `verify` - lightweight policy correctness checks. This is environment verification, not a performance result.
 
-The optional `concurrency` and `saturation` suites remain available for exploratory runs, but they are not started by `run-full-matrix.sh`.
+The optional `concurrency` and `saturation` suites remain available for exploratory runs. Use `run-full-matrix.sh all-tests` to include both; regular `all` includes the main thesis matrix only.
 
-## Default steady-load matrix
+## Default steady-load matrix (see also `BENCHMARK_150_300.md`)
 
-The default values are conservative and can be changed without editing files:
+The defaults are 150/300 RPS, 100 preallocated k6 VUs (hard maximum), three repetitions and 45-second measurements. The same limits apply by default to steady, churn, L4 attack and L7 spaghetti scenarios. The default values can be changed without editing files:
 
 ```bash
-RATES="100 200 300 400 500"
+RATES="150 300"
 REPEATS=3
 STEADY_DURATION=45s
-BENCHMARK_VUS=300
+BENCHMARK_VUS=100
 ```
 
 Run a short pilot first if the hardware or Kubernetes version changes.
@@ -169,10 +169,10 @@ bash scripts/run-benchmark-suite.sh calico-baseline steady
 Custom RPS range:
 
 ```bash
-RATES="100 200 300 400 500" \
+RATES="150 300" \
 REPEATS=3 \
 STEADY_DURATION=45s \
-BENCHMARK_VUS=300 \
+BENCHMARK_VUS=100 \
 bash scripts/run-benchmark-suite.sh ambient-l7 steady
 ```
 
@@ -181,7 +181,7 @@ The k6 load-generator pod is scheduled away from the server pod when the two-nod
 ## Run connection churn
 
 ```bash
-CHURN_RPS=200 \
+CHURN_RATES="150 300" \
 CHURN_DURATION=45s \
 REPEATS=3 \
 bash scripts/run-benchmark-suite.sh calico-l4 churn
@@ -194,12 +194,12 @@ By default the suite runs both normal connection reuse and `noConnectionReuse=tr
 Run it on the two L4 models:
 
 ```bash
-L4_ATTACK_RATES="200 400 600" \
+L4_ATTACK_RATES="150 300" \
 L4_ATTACK_BLOCKED_PERCENT=50 \
 REPEATS=3 \
 bash scripts/run-benchmark-suite.sh calico-l4 l4-attack
 
-L4_ATTACK_RATES="200 400 600" \
+L4_ATTACK_RATES="150 300" \
 L4_ATTACK_BLOCKED_PERCENT=50 \
 REPEATS=3 \
 bash scripts/run-benchmark-suite.sh ambient-l4 l4-attack
@@ -217,13 +217,13 @@ Both streams use new connections. The blocked share can be changed from 1 to 99 
 Run it on the two L7 models:
 
 ```bash
-L7_SPAGHETTI_RPS=300 \
+L7_SPAGHETTI_RATES="150 300" \
 L7_SPAGHETTI_BLOCKED_PERCENT=50 \
 L7_SPAGHETTI_VARIANTS="simple spaghetti" \
 REPEATS=3 \
 bash scripts/run-benchmark-suite.sh calico-l7 l7-spaghetti
 
-L7_SPAGHETTI_RPS=300 \
+L7_SPAGHETTI_RATES="150 300" \
 L7_SPAGHETTI_BLOCKED_PERCENT=50 \
 L7_SPAGHETTI_VARIANTS="simple spaghetti" \
 REPEATS=3 \
@@ -245,10 +245,16 @@ This helper creates one clean model, verifies it, runs steady load and churn, ru
 bash scripts/run-full-matrix.sh
 ```
 
+For the main matrix and optional concurrency/saturation diagnostics together:
+
+```bash
+bash scripts/run-full-matrix.sh all-tests
+```
+
 Override values as normal environment variables:
 
 ```bash
-RATES="100 200 300 400 500" REPEATS=3 bash scripts/run-full-matrix.sh
+RATES="150 300" REPEATS=3 bash scripts/run-full-matrix.sh
 ```
 
 Set `CLEANUP_AFTER_MODEL=false` only when you explicitly want to keep the most recently created clusters.
@@ -261,14 +267,14 @@ RUN_L4_ATTACK=false RUN_L7_SPAGHETTI=false bash scripts/run-full-matrix.sh
 
 ## Results
 
-Only the two master CSV files are kept:
+The master CSV outputs are:
 
 ```text
 results/benchmark-summary.csv
 results/benchmark-resources.csv
 ```
 
-k6 logs are streamed to the terminal. Summary JSON and raw resource samples are temporary and are deleted after their values are appended to the master CSV files. No `results/<model>/` directories are created.
+k6 logs are streamed to the terminal. Summary JSON and raw resource samples are temporary and are deleted after their values are appended to the master CSV files. Benchmark configuration metadata is saved; CPU throttling snapshots are not collected. No `results/<model>/` directories are created. The raw per-request k6 timing stream is not saved by default; all **per-run summary rows** are retained, including runs with anomalous latency or drops.
 
 If the archive already contains CSV files from an older schema, the first new run expands their headers atomically and keeps every existing row. Unknown columns still stop the write instead of being discarded.
 

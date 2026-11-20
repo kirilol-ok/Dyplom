@@ -10,31 +10,31 @@ Usage:
 Examples:
   bash scripts/run-benchmark-suite.sh calico-l4 verify
 
-  RATES="100 200 300 400 500" \
+  RATES="150 300" \
   REPEATS=3 \
   bash scripts/run-benchmark-suite.sh ambient-l7 steady
 
-  CHURN_RATES="100 200 300 400 500" \
-  BENCHMARK_VUS=400 \
+  CHURN_RATES="150 300" \
+  BENCHMARK_VUS=100 \
   REPEATS=3 \
   bash scripts/run-benchmark-suite.sh calico-l7 churn
 
-  VUS_LEVELS="5 10 20 40 80 120 160" \
+  VUS_LEVELS="5 10 20 40 80 100" \
   REPEATS=3 \
   CONCURRENCY_DURATION=45s \
   bash scripts/run-benchmark-suite.sh calico-baseline concurrency
 
-  SATURATION_RATES="1000 1250 1500 1750 2000 2250" \
-  SATURATION_VUS=1000 \
+  SATURATION_RATES="150 300" \
+  SATURATION_VUS=100 \
   REPEATS=1 \
   SATURATION_DURATION=30s \
   bash scripts/run-benchmark-suite.sh calico-baseline saturation
 
-  L4_ATTACK_RATES="200 400 600" \
+  L4_ATTACK_RATES="150 300" \
   L4_ATTACK_BLOCKED_PERCENT=50 \
   bash scripts/run-benchmark-suite.sh calico-l4 l4-attack
 
-  L7_SPAGHETTI_RPS=300 \
+  L7_SPAGHETTI_RATES="150 300" \
   L7_SPAGHETTI_VARIANTS="simple spaghetti" \
   bash scripts/run-benchmark-suite.sh ambient-l7 l7-spaghetti
 USAGE
@@ -56,39 +56,40 @@ case "${SUITE}" in
   *) usage; exit 1 ;;
 esac
 
-RATES="${RATES:-100 200 300 400 500}"
+RATES="${RATES:-150 300}"
 REPEATS="${REPEATS:-3}"
-BENCHMARK_VUS="${BENCHMARK_VUS:-300}"
+BENCHMARK_VUS="${BENCHMARK_VUS:-100}"
 STEADY_DURATION="${STEADY_DURATION:-45s}"
 VERIFY_DURATION="${VERIFY_DURATION:-5s}"
 
-# CHURN_RATES accepts a space-separated list, e.g. "100 200 300 400 500".
+# CHURN_RATES accepts a space-separated list, e.g. "150 300".
 # CHURN_RPS is kept as a backwards-compatible fallback for old commands.
-CHURN_RATES="${CHURN_RATES:-${CHURN_RPS:-200}}"
+CHURN_RATES="${CHURN_RATES:-${CHURN_RPS:-${RATES}}}"
 CHURN_DURATION="${CHURN_DURATION:-45s}"
 CHURN_COMPARE_REUSE="${CHURN_COMPARE_REUSE:-true}"
 # Give a freshly created cluster time to finish background reconciliation before
 # the first measured churn run. Set to 0 to disable.
 CHURN_INITIAL_SETTLE_SECONDS="${CHURN_INITIAL_SETTLE_SECONDS:-60}"
 
-VUS_LEVELS="${VUS_LEVELS:-5 10 20 40 80}"
+VUS_LEVELS="${VUS_LEVELS:-5 10 20 40 80 100}"
 CONCURRENCY_DURATION="${CONCURRENCY_DURATION:-45s}"
 CONCURRENCY_SLEEP_MS="${CONCURRENCY_SLEEP_MS:-100}"
 
-SATURATION_RATES="${SATURATION_RATES:-1000 1250 1500 1750 2000 2250}"
-SATURATION_VUS="${SATURATION_VUS:-1000}"
+SATURATION_RATES="${SATURATION_RATES:-${RATES}}"
+SATURATION_VUS="${SATURATION_VUS:-${BENCHMARK_VUS}}"
 SATURATION_DURATION="${SATURATION_DURATION:-30s}"
 
-L4_ATTACK_RATES="${L4_ATTACK_RATES:-200 400 600}"
+L4_ATTACK_RATES="${L4_ATTACK_RATES:-${RATES}}"
 L4_ATTACK_BLOCKED_PERCENT="${L4_ATTACK_BLOCKED_PERCENT:-50}"
 L4_ATTACK_DURATION="${L4_ATTACK_DURATION:-45s}"
-L4_ATTACK_VUS="${L4_ATTACK_VUS:-300}"
+L4_ATTACK_VUS="${L4_ATTACK_VUS:-${BENCHMARK_VUS}}"
 L4_ATTACK_TIMEOUT="${L4_ATTACK_TIMEOUT:-1s}"
 
-L7_SPAGHETTI_RPS="${L7_SPAGHETTI_RPS:-300}"
+# L7_SPAGHETTI_RPS remains supported for legacy one-rate commands.
+L7_SPAGHETTI_RATES="${L7_SPAGHETTI_RATES:-${L7_SPAGHETTI_RPS:-${RATES}}}"
 L7_SPAGHETTI_BLOCKED_PERCENT="${L7_SPAGHETTI_BLOCKED_PERCENT:-50}"
 L7_SPAGHETTI_DURATION="${L7_SPAGHETTI_DURATION:-45s}"
-L7_SPAGHETTI_VUS="${L7_SPAGHETTI_VUS:-300}"
+L7_SPAGHETTI_VUS="${L7_SPAGHETTI_VUS:-${BENCHMARK_VUS}}"
 L7_SPAGHETTI_VARIANTS="${L7_SPAGHETTI_VARIANTS:-simple spaghetti}"
 POLICY_SETTLE_SECONDS="${POLICY_SETTLE_SECONDS:-5}"
 
@@ -402,12 +403,12 @@ run_l4_attack_suite() {
 run_l7_spaghetti_suite() {
   local model="$1"
   local variant
+  local rate
   local run
 
   [[ "$(model_level "${model}")" == "l7" ]] || \
     die "The l7-spaghetti suite requires calico-l7 or ambient-l7, not ${model}"
 
-  split_policy_rate "${L7_SPAGHETTI_RPS}" "${L7_SPAGHETTI_BLOCKED_PERCENT}"
   ensure_model_ready "${model}"
   ACTIVE_L7_POLICY_MODEL="${model}"
 
@@ -428,27 +429,30 @@ run_l7_spaghetti_suite() {
 
     sleep "${POLICY_SETTLE_SECONDS}"
 
-    for run in $(seq 1 "${REPEATS}"); do
-      msg "L7 rules ${model}: variant=${variant}, total=${L7_SPAGHETTI_RPS} RPS, repetition=${run}/${REPEATS}"
+    for rate in ${L7_SPAGHETTI_RATES}; do
+      split_policy_rate "${rate}" "${L7_SPAGHETTI_BLOCKED_PERCENT}"
+      for run in $(seq 1 "${REPEATS}"); do
+        msg "L7 rules ${model}: variant=${variant}, total=${rate} RPS, repetition=${run}/${REPEATS}"
 
-      run_case "${model}" l7-spaghetti.js \
-        RUN_TAG="l7-${variant}-rps${L7_SPAGHETTI_RPS}-run${run}" \
-        VUS="${L7_SPAGHETTI_VUS}" \
-        RPS="${L7_SPAGHETTI_RPS}" \
-        ALLOWED_RPS="${ALLOWED_SPLIT}" \
-        BLOCKED_RPS="${BLOCKED_SPLIT}" \
-        DURATION="${L7_SPAGHETTI_DURATION}" \
-        TARGET_URL=http://server:8080 \
-        REQUEST_METHOD=GET \
-        REQUEST_PATH=/api/data \
-        BLOCKED_TARGET_URL=http://server:8080 \
-        BLOCKED_METHOD=POST \
-        BLOCKED_PATH=/api/data \
-        TEST_MODE=l7-spaghetti \
-        SCENARIO_VARIANT="${variant}" \
-        NO_CONNECTION_REUSE=false \
-        TIMEOUT=3s \
-        SLEEP_MS=0
+        run_case "${model}" l7-spaghetti.js \
+          RUN_TAG="l7-${variant}-rps${rate}-run${run}" \
+          VUS="${L7_SPAGHETTI_VUS}" \
+          RPS="${rate}" \
+          ALLOWED_RPS="${ALLOWED_SPLIT}" \
+          BLOCKED_RPS="${BLOCKED_SPLIT}" \
+          DURATION="${L7_SPAGHETTI_DURATION}" \
+          TARGET_URL=http://server:8080 \
+          REQUEST_METHOD=GET \
+          REQUEST_PATH=/api/data \
+          BLOCKED_TARGET_URL=http://server:8080 \
+          BLOCKED_METHOD=POST \
+          BLOCKED_PATH=/api/data \
+          TEST_MODE=l7-spaghetti \
+          SCENARIO_VARIANT="${variant}" \
+          NO_CONNECTION_REUSE=false \
+          TIMEOUT=3s \
+          SLEEP_MS=0
+      done
     done
   done
 
@@ -503,8 +507,6 @@ for model in "${MODELS[@]}"; do
       run_verify_suite "${model}"
       run_steady_suite "${model}"
       run_churn_suite "${model}"
-      run_concurrency_suite "${model}"
-      run_saturation_suite "${model}"
       if [[ "$(model_level "${model}")" == "l4" ]]; then
         run_l4_attack_suite "${model}"
       fi
